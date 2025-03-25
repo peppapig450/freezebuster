@@ -1,19 +1,17 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::SystemInformation::{
-    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
-};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
-    GetProcessIoCounters, GetProcessTimes, IO_COUNTERS, OpenProcess, PROCESS_QUERY_INFORMATION,
-    PROCESS_TERMINATE, TerminateProcess,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
 };
 
 // For serialization:deserialization of the configuration
@@ -32,19 +30,17 @@ use windows_service::{
 };
 
 /// Configuration structure loaded from config.json
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Config {
-    max_cpu_percent: f64,    // Maximum allowed CPU usage percentage (e.g., 80.0)
-    max_memory_percent: f64, // Maximum allowed memory usage percentage (e.g., 10.0)
-    max_io_operations_per_second: u64, // Maximum allowed I/O operations per second (e.g., 1000)
-    whitelist: Vec<String>,  // Process names to exclude from termination (e.g., ["explorer.exe"])
+    max_working_set_growth_mb_per_sec: f64, // Max growth rate of working set (MB/sec)
+    min_available_memory_mb: u64,           // Minimum available physical memory (MB)
+    whitelist: Vec<String>,
 }
 
-/// Stores previous resource usage data for a process to calculate deltas
+/// Stores previous resource usage data for a process
 struct ProcessData {
-    prev_kernel_time: FILETIME, // Previous kernel time for CPU usage calculation
-    prev_user_time: FILETIME,   // Previous user time for CPU usage calculation
-    prev_io_counters: IO_COUNTERS, // Previous I/O counters for I/O rate calculation
+    prev_working_set: u64, // Previous working set size (bytes)
+    prev_time: Instant,    // Time of last measurement
 }
 
 // Define the Windows service entry point
