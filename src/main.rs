@@ -34,6 +34,8 @@ use windows_service::{
 struct Config {
     max_working_set_growth_mb_per_sec: f64, // Max growth rate of working set (MB/sec)
     min_available_memory_mb: u64,           // Minimum available physical memory (MB)
+    max_page_faults_per_sec: u64,
+    violations_before_termination: u32,
     whitelist: Vec<String>,
 }
 
@@ -41,6 +43,9 @@ struct Config {
 struct ProcessData {
     prev_working_set: u64, // Previous working set size (bytes)
     prev_time: Instant,    // Time of last measurement
+    prev_page_faults: u32,
+    working_set_violations: u32,
+    page_fault_violations: u32,
 }
 
 // Define the Windows service entry point
@@ -93,6 +98,9 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
         wait_hint: Duration::from_secs(0),
         process_id: None,
     })?;
+
+    let mut process_data = HashMap::new();
+    let total_memory = get_total_memory();
 }
 
 /// Reads the configuration from a JSON file
@@ -112,9 +120,59 @@ fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
 fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
     let config = ConfigBuilder::new().set_time_format_rfc3339().build();
     CombinedLogger::init(vec![WriteLogger::new(
-        LevelFilter::Info,
+        LevelFilter::Warn,
         config,
         File::create(log_file)?,
     )])?;
     Ok(())
+}
+
+/// Retrieves the total physical memory in bytes.
+///
+/// Returns 0 if the call fails, logging an error.
+fn get_total_memory() -> u64 {
+    let mut mem_info = MEMORYSTATUSEX::default();
+    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+        mem_info.ullTotalPhys
+    } else {
+        error!("Failed to get total memory, defaulting to 0");
+        0
+    }
+}
+
+/// Retrieves the available physical memory in bytes.
+///
+/// Returns 0 if the call fails, logging an error.
+fn get_available_memory() -> u64 {
+    let mut mem_info = MEMORYSTATUSEX::default();
+    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+        mem_info.ullAvailPhys
+    } else {
+        error!("Failed to get available memory, defaulting to 0");
+        0
+    }
+}
+
+/// Adjusts sleep duration using exponential scaling based on memory load.
+///
+/// Sleep time decreases exponentially as memory load increases, ensuring rapid response
+/// during high pressure and reduced overhead during low pressure.
+fn adjust_sleep_duration() -> Duration {
+    const MAX_SLEEP_SECS: f64 = 30.0; // Maximum sleep time at 0% load
+    const MIN_SLEEP_SECS: f64 = 0.1; // Minimum sleep time at 100% load
+    const K: f64 = 3.0; // Scaling factor for steepness
+
+    let mut mem_info = MEMORYSTATUSEX::default();
+    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+        let memory_load = mem_info.dwMemoryLoad as f64 / 100.0; // 0.0 to 1.0
+        // Exponential decay: S = S_max * e^(-k * L)
+        let sleep_secs = MAX_SLEEP_SECS * (-K * memory_load).exp();
+        // Clamp between min and max sleep times
+        Duration::from_secs_f64(sleep_secs.clamp(MIN_SLEEP_SECS, MAX_SLEEP_SECS))
+    } else {
+        Duration::from_secs(5) // Default fallback if memory info unavailable
+    }
 }
