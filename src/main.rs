@@ -30,3 +30,36 @@ use windows_service::{
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
 };
+
+/// Configuration structure loaded from config.json
+#[derive(Deserialize)]
+struct Config {
+    max_cpu_percent: f64,    // Maximum allowed CPU usage percentage (e.g., 80.0)
+    max_memory_percent: f64, // Maximum allowed memory usage percentage (e.g., 10.0)
+    max_io_operations_per_second: u64, // Maximum allowed I/O operations per second (e.g., 1000)
+    whitelist: Vec<String>,  // Process names to exclude from termination (e.g., ["explorer.exe"])
+}
+
+/// Reads the configuration from a JSON file
+fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut config: Config = serde_json::from_reader(file)?;
+    // Convert whitelist to lowercase for case-insensitive comparison
+    config.whitelist = config
+        .whitelist
+        .into_iter()
+        .map(|s: String| s.to_lowercase())
+        .collect();
+    Ok(config)
+}
+
+/// Sets up file logging with timestamps
+fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
+    let config = ConfigBuilder::new().set_time_format_rfc3339().build();
+    CombinedLogger::init(vec![WriteLogger::new(
+        LevelFilter::Info,
+        config,
+        File::create(log_file)?,
+    )])?;
+    Ok(())
+}

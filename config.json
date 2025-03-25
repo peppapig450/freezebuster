@@ -1,0 +1,6 @@
+{
+  "max_cpu_percent": 80.0,
+  "max_memory_percent": 60.0,
+  "max_io_operations_per_second": 10000,
+  "whitelist": ["explorer.exe", "svchost.exe"]
+}
