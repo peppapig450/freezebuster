@@ -40,6 +40,65 @@ struct Config {
     whitelist: Vec<String>,  // Process names to exclude from termination (e.g., ["explorer.exe"])
 }
 
+/// Stores previous resource usage data for a process to calculate deltas
+struct ProcessData {
+    prev_kernel_time: FILETIME, // Previous kernel time for CPU usage calculation
+    prev_user_time: FILETIME,   // Previous user time for CPU usage calculation
+    prev_io_counters: IO_COUNTERS, // Previous I/O counters for I/O rate calculation
+}
+
+// Define the Windows service entry point
+define_windows_service!(ffi_service_main, freeze_buster_service);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Read configuration from config.json
+    let config_path = "config.json";
+    let config = read_config(config_path)?;
+
+    // Initialize logging to service.log
+    let log_path = "service.log";
+    setup_logging(log_path)?;
+
+    info!("FreezeBusterService starting...");
+
+    // Start the service
+    service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
+    Ok(())
+}
+
+/// Service logic
+fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
+    if let Err(e) = run_service(arguments) {
+        error!("Service failed: {}", e);
+    }
+}
+
+fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
+    let config = read_config("config.json")?;
+
+    let status_handle = service_control_handler::register(
+        "FreezeBusterService",
+        |control_event| match control_event {
+            ServiceControl::Stop => {
+                info!("Received stop signal");
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        },
+    )?;
+
+    // Set service to Running state
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(0),
+        process_id: None,
+    })?;
+}
+
 /// Reads the configuration from a JSON file
 fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
     let file = File::open(path)?;
