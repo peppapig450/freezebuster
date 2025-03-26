@@ -22,7 +22,6 @@ name = "freezebuster"
 version = "0.1.0"
 dependencies = [
  "log",
- "once_cell",
  "serde",
  "serde_json",
  "simplelog",
@@ -68,12 +67,6 @@ checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "once_cell"
-version = "1.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d75b0bedcc4fe52caa0e03d9f1151a323e4aa5e2d78ba3580400cd3c9e2bc4bc"
 
 [[package]]
 name = "powerfmt"
