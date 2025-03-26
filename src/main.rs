@@ -8,11 +8,13 @@ use std::fs::File;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::LUID;
+use windows::Win32::Security::LookupPrivilegeValueW;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
     Security::{
-        AdjustTokenPrivileges, ConvertSid, ConvertSidToStringSidW, GetTokenInformation,
+        AdjustTokenPrivileges, Authorization::ConvertSidToStringSidW, GetTokenInformation,
         LUID_AND_ATTRIBUTES, LookupPrivilegeValueA, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
@@ -90,26 +92,31 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
     }
 }
 
-fn enable_se_debug_privilege() -> Result<(), Error> {
+fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
+    let mut token: HANDLE = HANDLE(std::ptr::null_mut());
     unsafe {
-        let mut token: HANDLE = HANDLE(0);
         OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
-
-        let mut luid = std::mem::zeroed();
-        LookupPrivilegeValueA(None, SE_DEBUG_NAME, &mut luid)?;
-
-        let mut tp = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES {
-                Luid: luid,
-                Attributes: SE_PRIVILEGE_ENABLED,
-            }],
-        };
-
-        AdjustTokenPrivileges(token, false, &mut tp, 0, None, None)?;
-        CloseHandle(token)?;
-        Ok(())
     }
+
+    let mut luid: LUID = unsafe { std::mem::zeroed() };
+    unsafe {
+        LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
+    }
+
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+
+    unsafe {
+        AdjustTokenPrivileges(token, false, Some(&tp as *const _), 0, None, None)?;
+        CloseHandle(token)?;
+    }
+
+    Ok(())
 }
 
 fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
