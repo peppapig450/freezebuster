@@ -1,4 +1,4 @@
-use std::{alloc::System, os::raw::c_void};
+use std::os::raw::c_void;
 
 use std::sync::OnceLock;
 use windows::{
@@ -8,9 +8,7 @@ use windows::{
             CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, TOKEN_QUERY, TOKEN_USER,
             TokenUser, WinLocalSystemSid,
         },
-        System::Threading::{
-            IsProcessCritical, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        },
+        System::Threading::{IsProcessCritical, OpenProcessToken},
     },
     core::{BOOL, Error},
 };
