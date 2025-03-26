@@ -1,42 +1,39 @@
 mod system;
 
-use crate::system::check_process;
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::ffi::OsString;
-use std::fs::File;
-use std::os::windows::ffi::OsStringExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-use windows::Win32::Foundation::LUID;
-use windows::Win32::Security::LookupPrivilegeValueW;
-use windows::Win32::System::Diagnostics::ToolHelp::Process32FirstW;
-use windows::Win32::System::Threading::GetCurrentProcess;
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    ffi::OsString,
+    fs::File,
+    os::windows::ffi::OsStringExt,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+
+// For logging
+use log::{error, info, warn};
+// For serialization:deserialization of the configuration
+use serde::Deserialize;
+use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, WriteLogger};
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+    Foundation::{CloseHandle, HANDLE, LUID},
     Security::{
-        AdjustTokenPrivileges, Authorization::ConvertSidToStringSidW, GetTokenInformation,
-        LUID_AND_ATTRIBUTES, LookupPrivilegeValueA, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
     },
     System::{
         Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32NextW, TH32CS_SNAPPROCESS,
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
         },
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
-            TerminateProcess,
+            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+            PROCESS_TERMINATE, TerminateProcess,
         },
     },
 };
-
-// For serialization:deserialization of the configuration
-use serde::Deserialize;
-// For logging
-use log::{error, info, warn};
-use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, WriteLogger};
 use windows_service::{
     define_windows_service,
     service::{
@@ -46,6 +43,8 @@ use windows_service::{
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
 };
+
+use crate::system::check_process;
 
 /// Configuration structure loaded from config.json
 #[derive(Deserialize, Debug)]

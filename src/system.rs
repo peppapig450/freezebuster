@@ -1,6 +1,5 @@
-use std::os::raw::c_void;
+use std::{os::raw::c_void, sync::OnceLock};
 
-use std::sync::OnceLock;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
