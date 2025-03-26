@@ -173,7 +173,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
         controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
-        wait_hint: 0,
+        wait_hint: Duration::from_secs(0),
         process_id: None,
     })?;
 
