@@ -164,121 +164,7 @@ impl ServiceContext {
     }
 }
 
-// Define the Windows service entry point
-define_windows_service!(ffi_service_main, freeze_buster_service);
-
-fn main() -> Result<(), Box<dyn Error>> {
-    // Read configuration from config.json
-    let config_path = "config.json";
-    let config = read_config(config_path)?;
-
-    // Initialize logging to service.log
-    let log_path = "service.log";
-    setup_logging(log_path)?;
-
-    info!("FreezeBusterService starting with config: {config:?}");
-
-    // Start the service
-    service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
-    Ok(())
-}
-
-/// Service logic
-fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
-    if let Err(e) = run_service(arguments) {
-        error!("Service failed: {e}");
-    }
-}
-
-fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
-    let mut token: WinHandle = WinHandle(std::ptr::null_mut());
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
-    }
-
-    let mut luid: LUID = unsafe { std::mem::zeroed() };
-    unsafe {
-        LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
-    }
-
-    let tp = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-
-    unsafe {
-        AdjustTokenPrivileges(token, false, Some(&raw const tp), 0, None, None)?;
-        CloseHandle(token)?;
-    }
-
-    Ok(())
-}
-
-fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
-    let config = read_config("config.json")?;
-    enable_se_debug_privilege()?;
-
-    let status_handle = service_control_handler::register(
-        "FreezeBusterService",
-        |control_event| match control_event {
-            ServiceControl::Stop => {
-                info!("Received stop signal");
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        },
-    )?;
-
-    // Set service to Running state
-    status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::from_secs(0),
-        process_id: None,
-    })?;
-
-    let mut process_data = HashMap::new();
-    let total_memory = get_total_memory();
-    let mut system_processes = HashMap::new();
-    let mut first_run = true;
-
-    let stop = AtomicBool::new(false);
-    while !stop.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        if let Err(e) = monitor_and_terminate(
-            &config,
-            &mut process_data,
-            total_memory,
-            now,
-            &mut system_processes,
-            &mut first_run,
-        ) {
-            error!("Monitoring error: {e}");
-        }
-        let sleep_duration = adjust_sleep_duration();
-        std::thread::sleep(sleep_duration);
-    }
-
-    status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::from_secs(0),
-        process_id: None,
-    })?;
-
-    info!("Service stopped.");
-    Ok(())
-}
-
+// Utility functions
 /// Reads the configuration from a JSON file
 fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
     let file = File::open(path)?;
@@ -302,6 +188,13 @@ fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
         File::create(log_file)?,
     )])?;
     Ok(())
+}
+
+fn wide_to_string(wide: &[u16]) -> String {
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    OsString::from_wide(&wide[..len])
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Retrieves the total physical memory in bytes.
@@ -358,6 +251,33 @@ fn adjust_sleep_duration() -> Duration {
     } else {
         Duration::from_secs(5) // Default fallback if memory info unavailable
     }
+}
+
+fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
+    let mut token: WinHandle = WinHandle(std::ptr::null_mut());
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
+    }
+
+    let mut luid: LUID = unsafe { std::mem::zeroed() };
+    unsafe {
+        LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
+    }
+
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+
+    unsafe {
+        AdjustTokenPrivileges(token, false, Some(&raw const tp), 0, None, None)?;
+        CloseHandle(token)?;
+    }
+
+    Ok(())
 }
 
 /// Monitors processes and terminates them based on primary and fallback strategies.
@@ -526,11 +446,94 @@ fn monitor_and_terminate(
     Ok(())
 }
 
-fn wide_to_string(wide: &[u16]) -> String {
-    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
-    OsString::from_wide(&wide[..len])
-        .to_string_lossy()
-        .into_owned()
+// Service implementation
+
+// Define the Windows service entry point
+define_windows_service!(ffi_service_main, freeze_buster_service);
+
+/// Service logic
+fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
+    if let Err(e) = run_service(arguments) {
+        error!("Service failed: {e}");
+    }
+}
+
+fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
+    let config = read_config("config.json")?;
+    enable_se_debug_privilege()?;
+
+    let status_handle = service_control_handler::register(
+        "FreezeBusterService",
+        |control_event| match control_event {
+            ServiceControl::Stop => {
+                info!("Received stop signal");
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        },
+    )?;
+
+    // Set service to Running state
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(0),
+        process_id: None,
+    })?;
+
+    let mut process_data = HashMap::new();
+    let total_memory = get_total_memory();
+    let mut system_processes = HashMap::new();
+    let mut first_run = true;
+
+    let stop = AtomicBool::new(false);
+    while !stop.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if let Err(e) = monitor_and_terminate(
+            &config,
+            &mut process_data,
+            total_memory,
+            now,
+            &mut system_processes,
+            &mut first_run,
+        ) {
+            error!("Monitoring error: {e}");
+        }
+        let sleep_duration = adjust_sleep_duration();
+        std::thread::sleep(sleep_duration);
+    }
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(0),
+        process_id: None,
+    })?;
+
+    info!("Service stopped.");
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Read configuration from config.json
+    let config_path = "config.json";
+    let config = read_config(config_path)?;
+
+    // Initialize logging to service.log
+    let log_path = "service.log";
+    setup_logging(log_path)?;
+
+    info!("FreezeBusterService starting with config: {config:?}");
+
+    // Start the service
+    service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
+    Ok(())
 }
 
 #[cfg(test)]
