@@ -7,19 +7,24 @@ use std::fs::File;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::{
-    ConvertSid, ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+    Security::{
+        ConvertSid, ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser, AdjustTokenPrivileges, LookupPrivilegeValueA, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED
+    },
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+        },
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+        Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+        },
+    },
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
-};
-use crate::system::is_system_process;
+use crate::system::check_process;
 
 // For serialization:deserialization of the configuration
 use serde::Deserialize;
@@ -81,8 +86,31 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
     }
 }
 
+fn enable_se_debug_privilege() -> <Result<(), Error>> {
+    unsafe {
+        let mut token: HANDLE = HANDLE(0);
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
+
+        let mut luid = std::mem::zeroed();
+        LookupPrivilegeValueA(None, SE_DEBUG_NAME, &mut luid)?;
+
+        let mut tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        AdjustTokenPrivileges(token, false, &mut tp, 0, None, None)?;
+        CloseHandle(token)?;
+        Ok(())
+    }
+}
+
 fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
     let config = read_config("config.json")?;
+    enable_se_debug_privilege()?;
 
     let status_handle = service_control_handler::register(
         "FreezeBusterService",
@@ -122,6 +150,7 @@ fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
         .into_iter()
         .map(|s: String| s.to_lowercase())
         .collect();
+    config.whitelist.sort();
     Ok(config)
 }
 
@@ -212,10 +241,122 @@ fn monitor_and_terminate(
                     .map_err(|_| "Failed to open process")?;
 
             // On first run, populate system_processes map
-            if *first_run && is_syst
+            if **first_run {
+                if let Ok(process_info) = check_process(process_handle) {
+                    if process_info.is_system || process_info.is_critical {
+                        system_processes.insert(pid, process_name.clone());
+                    }
+                } else {
+                    error!("Failed to check process properties for PID: {}", pid);
+                }
+            }
+
+            // Skip if in system_processes cache or whitelist
+            if system_processes.contains_key(&pid) || config.whitelist.binary_search(&process_name) {
+                unsafe { CloseHandle(hobject) }?;
+                if unsafe {
+                    Process32Next(snapshot, &mut entry)
+                }.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            let mut mem_counters = PROCESS_MEMORY_COUNTERS::default();
+            mem_counters.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+            if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err() {
+                warn!("Failed to get memory info for PID {}", pid);
+                unsafe { CloseHandle(handle) }?;
+                if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            let working_set = mem_counters.WorkingSetSize as u64;
+            let page_faults = mem_counters.PageFaultCount;
+
+            if let Some(data) = process_data.get_mut(&pid) {
+                let elapsed = now - data.prev_time;
+                if elapsed > Duration::from_secs(0) {
+                    let delta_working_set = working_set.saturating_sub(data.prev_working_set);
+                    let growth_mb_per_sec = (delta_working_set as f64 / (2 << 20)) / elapsed.as_secs_f64();
+                    let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
+                    let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
+
+                    if available_memory_mb < config.min_available_memory_mb && growth_mb_per_sec > config.max_working_set_growth_mb_per_sec {
+                        data.working_set_violations += 1;
+                        if data.working_set_violations >= config.violations_before_termination {
+                            // Double-check ownership and critical status before termination
+                            if let Ok(process_info) = check_process(process_handle) {
+                                if !process_info.is_critical && !process_info.is_system {
+                                    info!("Terminating PID {} ({}) due to excessive working set growth ({} MB/s) after {} violations",
+                                pid, process_name, growth_mb_per_sec, data.working_set_violations);
+                                    if unsafe {
+                                        TerminateProcess(handle, 1)
+                                    }.is_err() {
+                                        error!("Failed to terminate PID {}", pid);
+                                    }
+                                } else {
+                                    warn!("Skipped termination of critical/system PID {} ({})", pid, process_name);
+                                }
+                            } else {
+                                error!("Failed to check process properties for PID: {}", pid);
+                            }
+                        }
+                    } else {
+                        data.working_set_violations = 0;
+                    }
+
+                    if page_fault_rate > config.max_page_faults_per_sec as f64 {
+                        data.page_fault_violations += 1;
+                        if data.page_fault_violations >= config.violations_before_termination {
+                            if let Ok(process_info) = check_process(process_handle) {
+                                if !process_info.is_critical && !process_info.is_system {
+                                    info!(
+                                        "Terminating PID {} ({}) due to high page fault rate ({} faults/s) after {} violations",
+                                        pid, process_name, page_fault_rate, data.page_fault_violations
+                                    );
+                                    if unsafe {
+                                        TerminateProcess(handle, 1)
+                                    }.is_err() {
+                                        error!("Failed to terminate PID {}", pid);
+                                    }
+                                } else {
+                                    warn!("Skipped termination of critical/system PID {} ({})", pid, process_name);
+                                }
+                            } else {
+                                error!("Failed to check process properties for PID: {}", pid);
+                            }
+                        }
+                    } else {
+                        data.page_fault_violations = 0;
+                    }
+                }
+                data.prev_working_set = working_set;
+                data.prev_page_faults = page_faults;
+                data.prev_time = now;
+            } else {
+                process_data.insert(pid, ProcessData { prev_working_set: working_set, prev_time: now, prev_page_faults: page_faults, working_set_violations: 0, page_fault_violations: 0 });
+            }
+
+            unsafe { CloseHandle(handle) }?;
+            if unsafe {
+                Process32Next(snapshot, &mut entry)
+            }.is_err() {
+                break;
+            }
+
         }
-    } else {
     }
+
+    if **first_run {
+        **first_run = false; // Mark first run as complete
+    }
+
+    process_data.retain(|&pid, _| current_pids.contains(&pid));
+    unsafe { CloseHandle(snapshot)}?;
+    Ok(())
 }
 
 
