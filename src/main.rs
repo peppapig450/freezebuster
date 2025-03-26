@@ -152,6 +152,18 @@ impl WindowsApi for RealWindowsApi {
     }
 }
 
+// Service context holding the API and configuration
+pub struct ServiceContext {
+    api: Box<dyn WindowsApi>,
+    config: Config,
+}
+
+impl ServiceContext {
+    fn new(api: Box<dyn WindowsApi>, config: Config) -> Self {
+        ServiceContext { api, config }
+    }
+}
+
 // Define the Windows service entry point
 define_windows_service!(ffi_service_main, freeze_buster_service);
 
