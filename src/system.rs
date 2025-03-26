@@ -1,9 +1,9 @@
-use std::os::raw::c_void;
+use std::{alloc::System, os::raw::c_void};
 
 use std::sync::OnceLock;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, VARIANT_BOOL},
+        Foundation::{CloseHandle, HANDLE},
         Security::{
             CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, TOKEN_QUERY, TOKEN_USER,
             TokenUser, WinLocalSystemSid,
@@ -35,25 +35,34 @@ static SYSTEM_SID: OnceLock<Vec<u8>> = OnceLock::new();
 /// Returns an `Error` if `CreateWellKnownSid` fails (e.g., invalid SID type or system issue).
 /// This is rare for `WinLocalSystemSid`.
 fn get_system_sid() -> Result<&'static [u8], Error> {
-    SYSTEM_SID
-        .get_or_init(|| {
-            let mut sid_size = 0;
-            unsafe {
-                // First call: Get required size
-                CreateWellKnownSid(WinLocalSystemSid, None, None, &mut sid_size)?;
-                let mut sid = vec![0u8; sid_size as usize];
-                // Second call: Fill the buffer
-                CreateWellKnownSid(
-                    WinLocalSystemSid,
-                    None,
-                    Some(PSID(sid.as_mut_ptr() as *mut c_void)),
-                    &mut sid_size,
-                )?;
-                sid
-            }
-        })
-        .as_slice()
-        .ok_or_else(Error::from_win32())
+    SYSTEM_SID.get_or_init(|| {
+        let mut sid_size = 0;
+        unsafe {
+            // First call: Get required size
+            CreateWellKnownSid(WinLocalSystemSid, None, None, &mut sid_size)
+                .expect("Failed to get SYSTEM SID size");
+
+            let mut sid = vec![0u8; sid_size as usize];
+
+            // Second call: Fill the buffer
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                None,
+                Some(PSID(sid.as_mut_ptr() as *mut c_void)),
+                &mut sid_size,
+            )
+            .expect("Failed to create SYSTEM SID");
+
+            sid
+        }
+    });
+
+    // Since OnceLock::get returns Option<&T>, we need to handle the case where it's not initialized
+    // But in practice, this won't happen because get_or_init ensures initialization
+    Ok(SYSTEM_SID
+        .get()
+        .expect("System_SID initialization failed")
+        .as_slice())
 }
 
 /// Checks if a process is critical using IsProcessCritical.
