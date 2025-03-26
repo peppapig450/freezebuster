@@ -513,27 +513,32 @@ mod tests {
     // Mock ProcessData for testing growth calculations
     #[test]
     fn test_process_data_growth_calculation() {
+        use std::time::{Duration, Instant};
+
+        let start_time = Instant::now();
+        let elapsed = Duration::from_secs(1);
+        let prev_time = start_time - elapsed;
+
         let process_data = ProcessData {
             prev_working_set: 10_485_760, // 10 MB
-            prev_time: Instant::now() - Duration::from_secs(1),
+            prev_time,
             prev_page_faults: 100,
             working_set_violations: 0,
             page_fault_violations: 0,
         };
 
-        let now = Instant::now();
+        let now = start_time;
         let current_working_set = 20_971_520; // 20 MB
         let current_page_faults = 150;
 
-        let elapsed = now - process_data.prev_time;
+        let elapsed = now.duration_since(process_data.prev_time).as_secs_f64();
         let delta_working_set = current_working_set - process_data.prev_working_set;
-        let growth_mb_per_sec =
-            (delta_working_set as f64 / (2 << 20) as f64) / elapsed.as_secs_f64();
+        let growth_mb_per_sec = (delta_working_set as f64 / (1024.0 * 1024.0)) / elapsed;
         let delta_page_faults = current_page_faults - process_data.prev_page_faults;
-        let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
+        let page_fault_rate = delta_page_faults as f64 / elapsed;
 
-        assert!(growth_mb_per_sec > 9.0 && growth_mb_per_sec < 11.0); // Approx 10 MB/s
-        assert_eq!(page_fault_rate as u32, 50); // 50 faults/sec
+        assert!(growth_mb_per_sec > 9.0 && growth_mb_per_sec < 11.0);
+        assert_eq!(page_fault_rate as u32, 50); // 50 page faults per second
     }
 
     // Integration test suggestion (cannot run in standard test environment)
