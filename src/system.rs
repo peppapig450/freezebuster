@@ -12,7 +12,7 @@ use windows::{
             IsProcessCritical, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
-    core::Error,
+    core::{BOOL, Error},
 };
 
 /// Information about a process's status
@@ -61,9 +61,9 @@ fn get_system_sid() -> Result<&'static [u8], Error> {
 /// # Safety
 /// - `process_handle` must be a valid handle with at least `PROCESS_QUERY_LIMITED_INFORMATION`.
 unsafe fn check_is_critical(process_handle: HANDLE) -> Result<bool, Error> {
-    let mut is_critical: VARIANT_BOOL = 0;
+    let mut is_critical: BOOL = BOOL(0);
     unsafe { IsProcessCritical(process_handle, &mut is_critical)? };
-    Ok(is_critical != 0)
+    Ok(is_critical.0 != 0)
 }
 
 /// Checks if a process is a system process by comparing its token's SID with the SYSTEM SID.
