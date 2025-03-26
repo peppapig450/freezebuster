@@ -1,6 +1,7 @@
 {
-  "max_cpu_percent": 80.0,
-  "max_memory_percent": 60.0,
-  "max_io_operations_per_second": 10000,
-  "whitelist": ["explorer.exe", "svchost.exe"]
+  "max_working_set_growth_mb_per_sec": 10.0,
+  "min_available_memory_mb": 500,
+  "max_page_faults_per_sec": 1000,
+  "violations_before_termination": 3,
+  "whitelist": ["notepad.exe", "explorer.exe"]
 }
