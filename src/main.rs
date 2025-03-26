@@ -332,7 +332,7 @@ fn monitor_and_terminate(
                 if elapsed > Duration::from_secs(0) {
                     let delta_working_set = working_set.saturating_sub(data.prev_working_set);
                     let growth_mb_per_sec =
-                        (delta_working_set as f64 / f64::from(2 << 20)) / elapsed.as_secs_f64();
+                        (delta_working_set as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
                     let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
                     let page_fault_rate = f64::from(delta_page_faults) / elapsed.as_secs_f64();
 
