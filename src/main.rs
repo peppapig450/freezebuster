@@ -1,5 +1,6 @@
 mod system;
 
+use crate::system::check_process;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -11,20 +12,23 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
     Security::{
-        ConvertSid, ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser, AdjustTokenPrivileges, LookupPrivilegeValueA, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED
+        AdjustTokenPrivileges, ConvertSid, ConvertSidToStringSidW, GetTokenInformation,
+        LUID_AND_ATTRIBUTES, LookupPrivilegeValueA, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     System::{
         Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next,
+            TH32CS_SNAPPROCESS,
         },
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+            TerminateProcess,
         },
     },
 };
-use crate::system::check_process;
 
 // For serialization:deserialization of the configuration
 use serde::Deserialize;
@@ -86,7 +90,7 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
     }
 }
 
-fn enable_se_debug_privilege() -> <Result<(), Error>> {
+fn enable_se_debug_privilege() -> Result<(), Error> {
     unsafe {
         let mut token: HANDLE = HANDLE(0);
         OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
@@ -138,6 +142,36 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
     let total_memory = get_total_memory();
     let mut system_processes = HashMap::new();
     let mut first_run = true;
+
+    let stop = AtomicBool::new(false);
+    while !stop.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if let Err(e) = monitor_and_terminate(
+            &config,
+            &mut process_data,
+            total_memory,
+            now,
+            &mut system_processes,
+            &mut first_run,
+        ) {
+            error!("Monitoring error: {}", e)
+        }
+        let sleep_duration = adjust_sleep_duration();
+        std::thread::sleep(sleep_duration);
+    }
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: 0,
+        process_id: None,
+    })?;
+
+    info!("Service stopped.");
+    Ok(())
 }
 
 /// Reads the configuration from a JSON file
@@ -252,11 +286,10 @@ fn monitor_and_terminate(
             }
 
             // Skip if in system_processes cache or whitelist
-            if system_processes.contains_key(&pid) || config.whitelist.binary_search(&process_name) {
+            if system_processes.contains_key(&pid) || config.whitelist.binary_search(&process_name)
+            {
                 unsafe { CloseHandle(hobject) }?;
-                if unsafe {
-                    Process32Next(snapshot, &mut entry)
-                }.is_err() {
+                if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
                     break;
                 }
                 continue;
@@ -264,7 +297,8 @@ fn monitor_and_terminate(
 
             let mut mem_counters = PROCESS_MEMORY_COUNTERS::default();
             mem_counters.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
-            if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err() {
+            if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err()
+            {
                 warn!("Failed to get memory info for PID {}", pid);
                 unsafe { CloseHandle(handle) }?;
                 if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
@@ -280,25 +314,34 @@ fn monitor_and_terminate(
                 let elapsed = now - data.prev_time;
                 if elapsed > Duration::from_secs(0) {
                     let delta_working_set = working_set.saturating_sub(data.prev_working_set);
-                    let growth_mb_per_sec = (delta_working_set as f64 / (2 << 20)) / elapsed.as_secs_f64();
+                    let growth_mb_per_sec =
+                        (delta_working_set as f64 / (2 << 20)) / elapsed.as_secs_f64();
                     let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
                     let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
 
-                    if available_memory_mb < config.min_available_memory_mb && growth_mb_per_sec > config.max_working_set_growth_mb_per_sec {
+                    if available_memory_mb < config.min_available_memory_mb
+                        && growth_mb_per_sec > config.max_working_set_growth_mb_per_sec
+                    {
                         data.working_set_violations += 1;
                         if data.working_set_violations >= config.violations_before_termination {
                             // Double-check ownership and critical status before termination
                             if let Ok(process_info) = check_process(process_handle) {
                                 if !process_info.is_critical && !process_info.is_system {
-                                    info!("Terminating PID {} ({}) due to excessive working set growth ({} MB/s) after {} violations",
-                                pid, process_name, growth_mb_per_sec, data.working_set_violations);
-                                    if unsafe {
-                                        TerminateProcess(handle, 1)
-                                    }.is_err() {
+                                    info!(
+                                        "Terminating PID {} ({}) due to excessive working set growth ({} MB/s) after {} violations",
+                                        pid,
+                                        process_name,
+                                        growth_mb_per_sec,
+                                        data.working_set_violations
+                                    );
+                                    if unsafe { TerminateProcess(handle, 1) }.is_err() {
                                         error!("Failed to terminate PID {}", pid);
                                     }
                                 } else {
-                                    warn!("Skipped termination of critical/system PID {} ({})", pid, process_name);
+                                    warn!(
+                                        "Skipped termination of critical/system PID {} ({})",
+                                        pid, process_name
+                                    );
                                 }
                             } else {
                                 error!("Failed to check process properties for PID: {}", pid);
@@ -315,15 +358,19 @@ fn monitor_and_terminate(
                                 if !process_info.is_critical && !process_info.is_system {
                                     info!(
                                         "Terminating PID {} ({}) due to high page fault rate ({} faults/s) after {} violations",
-                                        pid, process_name, page_fault_rate, data.page_fault_violations
+                                        pid,
+                                        process_name,
+                                        page_fault_rate,
+                                        data.page_fault_violations
                                     );
-                                    if unsafe {
-                                        TerminateProcess(handle, 1)
-                                    }.is_err() {
+                                    if unsafe { TerminateProcess(handle, 1) }.is_err() {
                                         error!("Failed to terminate PID {}", pid);
                                     }
                                 } else {
-                                    warn!("Skipped termination of critical/system PID {} ({})", pid, process_name);
+                                    warn!(
+                                        "Skipped termination of critical/system PID {} ({})",
+                                        pid, process_name
+                                    );
                                 }
                             } else {
                                 error!("Failed to check process properties for PID: {}", pid);
@@ -337,16 +384,22 @@ fn monitor_and_terminate(
                 data.prev_page_faults = page_faults;
                 data.prev_time = now;
             } else {
-                process_data.insert(pid, ProcessData { prev_working_set: working_set, prev_time: now, prev_page_faults: page_faults, working_set_violations: 0, page_fault_violations: 0 });
+                process_data.insert(
+                    pid,
+                    ProcessData {
+                        prev_working_set: working_set,
+                        prev_time: now,
+                        prev_page_faults: page_faults,
+                        working_set_violations: 0,
+                        page_fault_violations: 0,
+                    },
+                );
             }
 
             unsafe { CloseHandle(handle) }?;
-            if unsafe {
-                Process32Next(snapshot, &mut entry)
-            }.is_err() {
+            if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
                 break;
             }
-
         }
     }
 
@@ -355,10 +408,9 @@ fn monitor_and_terminate(
     }
 
     process_data.retain(|&pid, _| current_pids.contains(&pid));
-    unsafe { CloseHandle(snapshot)}?;
+    unsafe { CloseHandle(snapshot) }?;
     Ok(())
 }
-
 
 fn wide_to_string(wide: &[u16]) -> String {
     OsString::from_wide(wide).to_string_lossy().into_owned()
