@@ -1,5 +1,3 @@
-mod system;
-
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -10,29 +8,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-// For logging
 use log::{error, info, warn};
-// For serialization:deserialization of the configuration
 use serde::Deserialize;
 use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, WriteLogger};
-use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, LUID},
-    Security::{
-        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
-        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-    },
-    System::{
-        Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-            TH32CS_SNAPPROCESS,
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE as WinHandle, LUID},
+        Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
         },
-        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-        SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
-        Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
-            PROCESS_TERMINATE, TerminateProcess,
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+                PROCESS_TERMINATE, TerminateProcess,
+            },
         },
     },
+    core::{Error as WinError, PCWSTR},
 };
 use windows_service::{
     define_windows_service,
@@ -44,7 +43,8 @@ use windows_service::{
     service_dispatcher,
 };
 
-use crate::system::check_process;
+mod system;
+use crate::system::{ProcessInfo, check_process};
 
 /// Configuration structure loaded from config.json
 #[derive(Deserialize, Debug)]
@@ -56,13 +56,48 @@ struct Config {
     whitelist: Vec<String>,
 }
 
-/// Stores previous resource usage data for a process
+/// Process data for tracking resource usage over time
+#[derive(Debug)]
 struct ProcessData {
     prev_working_set: u64, // Previous working set size (bytes)
     prev_time: Instant,    // Time of last measurement
     prev_page_faults: u32,
     working_set_violations: u32,
     page_fault_violations: u32,
+}
+
+// Trait for abstracting Windows API calls
+pub trait WindowsApi {
+    fn create_toolhelp32_snapshot(
+        &self,
+        flags: u32,
+        process_id: u32,
+    ) -> Result<WinHandle, WinError>;
+    fn process32_first_w(
+        &self,
+        snapshot: WinHandle,
+        entry: &mut PROCESSENTRY32W,
+    ) -> Result<(), WinError>;
+    fn process32_next_w(
+        &self,
+        snapshot: WinHandle,
+        entry: &mut PROCESSENTRY32W,
+    ) -> Result<(), WinError>;
+    fn open_process(
+        &self,
+        desired_access: u32,
+        inherit_handle: bool,
+        process_id: u32,
+    ) -> Result<WinHandle, WinError>;
+    fn get_process_memory_info(
+        &self,
+        process: WinHandle,
+        counters: &mut PROCESS_MEMORY_COUNTERS,
+        size: u32,
+    ) -> Result<WinHandle, WinError>;
+    fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError>;
+    fn close_handle(&self, handle: WinHandle) -> Result<(), WinError>;
+    fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError>;
 }
 
 // Define the Windows service entry point
@@ -92,7 +127,7 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
 }
 
 fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
-    let mut token: HANDLE = HANDLE(std::ptr::null_mut());
+    let mut token: WinHandle = WinHandle(std::ptr::null_mut());
     unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
     }
@@ -436,12 +471,12 @@ fn wide_to_string(wide: &[u16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{fs::File, io::Write, path::Path};
+
     use serde_json;
-    use std::fs::File;
-    use std::io::Write;
-    use std::path::Path;
     use tempfile::TempDir;
+
+    use super::*;
 
     // Helper function to create a temp config file
     fn create_temp_config(content: &str) -> (TempDir, String) {
