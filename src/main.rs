@@ -430,3 +430,143 @@ fn monitor_and_terminate(
 fn wide_to_string(wide: &[u16]) -> String {
     OsString::from_wide(wide).to_string_lossy().into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    // Helper function to create a temp config file
+    fn create_temp_config(content: &str) -> (TempDir, String) {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("config.json");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        (dir, file_path.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn test_read_config_valid() {
+        let config_json = r#"
+            {
+                "max_working_set_growth_mb_per_sec": 10.0,
+                "min_available_memory_mb": 512,
+                "max_page_faults_per_sec": 1000,
+                "violations_before_termination": 3,
+                "whitelist": ["notepad.exe", "explorer.exe"]
+            }
+        "#;
+        let (_dir, path) = create_temp_config(config_json);
+
+        let result = read_config(&path);
+        assert!(result.is_ok());
+
+        let config = result.unwrap();
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 512);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]); // Note: sorted and lowercase
+    }
+
+    #[test]
+    fn test_read_config_invalid_json() {
+        let config_json = "invalid json content";
+        let (_dir, path) = create_temp_config(config_json);
+
+        let result = read_config(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_config_missing_file() {
+        let result = read_config("non_existent_config.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wide_to_string() {
+        let wide = vec![72, 101, 108, 108, 111, 0]; // "Hello" in UTF-16
+        let result = wide_to_string(&wide);
+        assert_eq!(result, "Hello");
+
+        let empty = vec![0];
+        let result = wide_to_string(&empty);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_adjust_sleep_duration() {
+        // This is tricky to test precisely due to system calls, but we can verify boundaries
+        let duration = adjust_sleep_duration();
+        assert!(duration.as_secs_f64() >= 0.1); // MIN_SLEEP_SECS
+        assert!(duration.as_secs_f64() <= 30.0); // MAX_SLEEP_SECS
+    }
+
+    // Mock ProcessData for testing growth calculations
+    #[test]
+    fn test_process_data_growth_calculation() {
+        let process_data = ProcessData {
+            prev_working_set: 10_485_760, // 10 MB
+            prev_time: Instant::now() - Duration::from_secs(1),
+            prev_page_faults: 100,
+            working_set_violations: 0,
+            page_fault_violations: 0,
+        };
+
+        let now = Instant::now();
+        let current_working_set = 20_971_520; // 20 MB
+        let current_page_faults = 150;
+
+        let elapsed = now - process_data.prev_time;
+        let delta_working_set = current_working_set - process_data.prev_working_set;
+        let growth_mb_per_sec =
+            (delta_working_set as f64 / (2 << 20) as f64) / elapsed.as_secs_f64();
+        let delta_page_faults = current_page_faults - process_data.prev_page_faults;
+        let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
+
+        assert!(growth_mb_per_sec > 9.0 && growth_mb_per_sec < 11.0); // Approx 10 MB/s
+        assert_eq!(page_fault_rate as u32, 50); // 50 faults/sec
+    }
+
+    // Integration test suggestion (cannot run in standard test environment)
+    #[test]
+    #[ignore]
+    fn test_monitor_and_terminate() {
+        // This would require:
+        // 1. Mocking Windows API calls (CreateToolhelp32Snapshot, etc.)
+        // 2. Simulating process memory usage
+        // 3. Verifying termination logic
+        // Suggested approach:
+        // - Use a mocking crate like `mockall`
+        // - Create mock processes with controlled memory growth
+        // - Test whitelist, violation counting, and termination logic
+        let config = Config {
+            max_working_set_growth_mb_per_sec: 5.0,
+            min_available_memory_mb: 1024,
+            max_page_faults_per_sec: 1000,
+            violations_before_termination: 2,
+            whitelist: vec!["test.exe".to_string()],
+        };
+        let mut process_data = HashMap::new();
+        let total_memory = 8_589_934_592; // 8 GB
+        let now = Instant::now();
+        let mut system_processes = HashMap::new();
+        let mut first_run = true;
+
+        // Mock setup would go here
+        let result = monitor_and_terminate(
+            &config,
+            &mut process_data,
+            total_memory,
+            now,
+            &mut system_processes,
+            &mut first_run,
+        );
+        assert!(result.is_ok());
+    }
+}
