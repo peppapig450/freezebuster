@@ -5,6 +5,7 @@ use std::{
     fs::File,
     os::windows::ffi::OsStringExt,
     sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -200,12 +201,12 @@ fn wide_to_string(wide: &[u16]) -> String {
 /// Retrieves the total physical memory in bytes.
 ///
 /// Returns 0 if the call fails, logging an error.
-fn get_total_memory() -> u64 {
+fn get_total_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
-    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+    if ctx.api.global_memory_status_ex(&mut mem_info).is_ok() {
         mem_info.ullTotalPhys
     } else {
         error!("Failed to get total memory, defaulting to 0");
@@ -216,12 +217,12 @@ fn get_total_memory() -> u64 {
 /// Retrieves the available physical memory in bytes.
 ///
 /// Returns 0 if the call fails, logging an error.
-fn get_available_memory() -> u64 {
+fn get_available_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
-    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+    if ctx.api.global_memory_status_ex(&mut mem_info).is_ok() {
         mem_info.ullAvailPhys
     } else {
         error!("Failed to get available memory, defaulting to 0");
@@ -233,7 +234,7 @@ fn get_available_memory() -> u64 {
 ///
 /// Sleep time decreases exponentially as memory load increases, ensuring rapid response
 /// during high pressure and reduced overhead during low pressure.
-fn adjust_sleep_duration() -> Duration {
+fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
     const MAX_SLEEP_SECS: f64 = 30.0; // Maximum sleep time at 0% load
     const MIN_SLEEP_SECS: f64 = 0.1; // Minimum sleep time at 100% load
     const K: f64 = 3.0; // Scaling factor for steepness
@@ -242,7 +243,7 @@ fn adjust_sleep_duration() -> Duration {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
-    if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
+    if ctx.api.global_memory_status_ex(&mut mem_info).is_ok() {
         let memory_load = f64::from(mem_info.dwMemoryLoad) / 100.0; // 0.0 to 1.0
         // Exponential decay: S = S_max * e^(-k * L)
         let sleep_secs = MAX_SLEEP_SECS * (-K * memory_load).exp();
@@ -273,7 +274,7 @@ fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
     };
 
     unsafe {
-        AdjustTokenPrivileges(token, false, Some(&raw const tp), 0, None, None)?;
+        AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)?;
         CloseHandle(token)?;
     }
 
@@ -282,30 +283,31 @@ fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
 
 /// Monitors processes and terminates them based on primary and fallback strategies.
 fn monitor_and_terminate(
-    config: &Config,
+    ctx: &ServiceContext,
     process_data: &mut HashMap<u32, ProcessData>,
     _total_memory: u64,
     now: Instant,
     system_processes: &mut HashMap<u32, String>, // PID -> process name
     first_run: &mut bool,
 ) -> Result<(), Box<dyn Error>> {
-    let available_memory_mb = get_available_memory() >> 20;
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
+    let available_memory_mb = get_available_memory(ctx) >> 20;
+    let snapshot = ctx.api.create_toolhelp32_snapshot(TH32CS_SNAPPROCESS, 0)?;
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut current_pids = HashSet::new();
 
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+    if ctx.api.process32_first_w(snapshot, &mut entry).is_ok() {
         loop {
             let pid = entry.th32ProcessID;
             current_pids.insert(pid);
             let process_name = wide_to_string(&entry.szExeFile).to_lowercase();
 
-            let handle =
-                unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, false, pid) }
-                    .map_err(|_| "Failed to open process")?;
+            let handle = ctx
+                .api
+                .open_process(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, false, pid)
+                .map_err(|_| "Failed to open process")?;
 
             // On first run, populate system_processes map
             if *first_run {
@@ -320,10 +322,10 @@ fn monitor_and_terminate(
 
             // Skip if in system_processes cache or whitelist
             if system_processes.contains_key(&pid)
-                || config.whitelist.binary_search(&process_name).is_ok()
+                || ctx.config.whitelist.binary_search(&process_name).is_ok()
             {
-                unsafe { CloseHandle(handle) }?;
-                if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                ctx.api.close_handle(handle)?;
+                if ctx.api.process32_next_w(snapshot, &mut entry).is_err() {
                     break;
                 }
                 continue;
@@ -333,11 +335,15 @@ fn monitor_and_terminate(
                 cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
                 ..Default::default()
             };
-            if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err()
+            let mem_counters_size = mem_counters.cb;
+            if ctx
+                .api
+                .get_process_memory_info(handle, &mut mem_counters, mem_counters_size)
+                .is_err()
             {
                 warn!("Failed to get memory info for PID {pid}");
-                unsafe { CloseHandle(handle) }?;
-                if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                ctx.api.close_handle(handle)?;
+                if ctx.api.process32_next_w(snapshot, &mut entry).is_err() {
                     break;
                 }
                 continue;
@@ -355,11 +361,11 @@ fn monitor_and_terminate(
                     let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
                     let page_fault_rate = f64::from(delta_page_faults) / elapsed.as_secs_f64();
 
-                    if available_memory_mb < config.min_available_memory_mb
-                        && growth_mb_per_sec > config.max_working_set_growth_mb_per_sec
+                    if available_memory_mb < ctx.config.min_available_memory_mb
+                        && growth_mb_per_sec > ctx.config.max_working_set_growth_mb_per_sec
                     {
                         data.working_set_violations += 1;
-                        if data.working_set_violations >= config.violations_before_termination {
+                        if data.working_set_violations >= ctx.config.violations_before_termination {
                             // Double-check ownership and critical status before termination
                             if let Ok(process_info) = check_process(handle) {
                                 if !process_info.is_critical && !process_info.is_system {
@@ -370,7 +376,7 @@ fn monitor_and_terminate(
                                         growth_mb_per_sec,
                                         data.working_set_violations
                                     );
-                                    if unsafe { TerminateProcess(handle, 1) }.is_err() {
+                                    if ctx.api.terminate_process(handle, 1).is_err() {
                                         error!("Failed to terminate PID {pid}");
                                     }
                                 } else {
@@ -386,9 +392,9 @@ fn monitor_and_terminate(
                         data.working_set_violations = 0;
                     }
 
-                    if page_fault_rate > config.max_page_faults_per_sec as f64 {
+                    if page_fault_rate > ctx.config.max_page_faults_per_sec as f64 {
                         data.page_fault_violations += 1;
-                        if data.page_fault_violations >= config.violations_before_termination {
+                        if data.page_fault_violations >= ctx.config.violations_before_termination {
                             if let Ok(process_info) = check_process(handle) {
                                 if !process_info.is_critical && !process_info.is_system {
                                     info!(
@@ -398,7 +404,7 @@ fn monitor_and_terminate(
                                         page_fault_rate,
                                         data.page_fault_violations
                                     );
-                                    if unsafe { TerminateProcess(handle, 1) }.is_err() {
+                                    if ctx.api.terminate_process(handle, 1).is_err() {
                                         error!("Failed to terminate PID {pid}");
                                     }
                                 } else {
@@ -430,8 +436,8 @@ fn monitor_and_terminate(
                 );
             }
 
-            unsafe { CloseHandle(handle) }?;
-            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            ctx.api.close_handle(handle)?;
+            if ctx.api.process32_next_w(snapshot, &mut entry).is_err() {
                 break;
             }
         }
@@ -442,7 +448,7 @@ fn monitor_and_terminate(
     }
 
     process_data.retain(|&pid, _| current_pids.contains(&pid));
-    unsafe { CloseHandle(snapshot) }?;
+    ctx.api.close_handle(snapshot)?;
     Ok(())
 }
 
@@ -460,18 +466,24 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
 
 fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
     let config = read_config("config.json")?;
+    let api = Box::new(RealWindowsApi);
+    let ctx = ServiceContext::new(api, config);
     enable_se_debug_privilege()?;
 
-    let status_handle = service_control_handler::register(
-        "FreezeBusterService",
-        |control_event| match control_event {
-            ServiceControl::Stop => {
-                info!("Received stop signal");
-                ServiceControlHandlerResult::NoError
+    // Allocate stop on the heap and leak it to give it a 'static lifetime
+    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+
+    let status_handle =
+        service_control_handler::register("FreezeBusterService", move |control_event| {
+            match control_event {
+                ServiceControl::Stop => {
+                    info!("Received stop signal");
+                    stop.store(true, Ordering::SeqCst);
+                    ServiceControlHandlerResult::NoError
+                }
+                _ => ServiceControlHandlerResult::NotImplemented,
             }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        },
-    )?;
+        })?;
 
     // Set service to Running state
     status_handle.set_service_status(ServiceStatus {
@@ -485,15 +497,14 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
     })?;
 
     let mut process_data = HashMap::new();
-    let total_memory = get_total_memory();
+    let total_memory = get_total_memory(&ctx);
     let mut system_processes = HashMap::new();
     let mut first_run = true;
 
-    let stop = AtomicBool::new(false);
     while !stop.load(Ordering::SeqCst) {
         let now = Instant::now();
         if let Err(e) = monitor_and_terminate(
-            &config,
+            &ctx,
             &mut process_data,
             total_memory,
             now,
@@ -502,8 +513,8 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
         ) {
             error!("Monitoring error: {e}");
         }
-        let sleep_duration = adjust_sleep_duration();
-        std::thread::sleep(sleep_duration);
+        let sleep_duration = adjust_sleep_duration(&ctx);
+        thread::sleep(sleep_duration);
     }
 
     status_handle.set_service_status(ServiceStatus {
