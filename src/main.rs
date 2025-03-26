@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let log_path = "service.log";
     setup_logging(log_path)?;
 
-    info!("FreezeBusterService starting...");
+    info!("FreezeBusterService starting with config: {:?}", config);
 
     // Start the service
     service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
@@ -209,8 +209,10 @@ fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
 ///
 /// Returns 0 if the call fails, logging an error.
 fn get_total_memory() -> u64 {
-    let mut mem_info = MEMORYSTATUSEX::default();
-    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let mut mem_info = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
     if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
         mem_info.ullTotalPhys
     } else {
@@ -223,8 +225,10 @@ fn get_total_memory() -> u64 {
 ///
 /// Returns 0 if the call fails, logging an error.
 fn get_available_memory() -> u64 {
-    let mut mem_info = MEMORYSTATUSEX::default();
-    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let mut mem_info = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
     if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
         mem_info.ullAvailPhys
     } else {
@@ -242,8 +246,10 @@ fn adjust_sleep_duration() -> Duration {
     const MIN_SLEEP_SECS: f64 = 0.1; // Minimum sleep time at 100% load
     const K: f64 = 3.0; // Scaling factor for steepness
 
-    let mut mem_info = MEMORYSTATUSEX::default();
-    mem_info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let mut mem_info = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
     if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
         let memory_load = mem_info.dwMemoryLoad as f64 / 100.0; // 0.0 to 1.0
         // Exponential decay: S = S_max * e^(-k * L)
@@ -266,8 +272,10 @@ fn monitor_and_terminate(
 ) -> Result<(), Box<dyn Error>> {
     let available_memory_mb = get_available_memory() >> 20;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
-    let mut entry = PROCESSENTRY32W::default();
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
     let mut current_pids = HashSet::new();
 
     if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
@@ -302,8 +310,10 @@ fn monitor_and_terminate(
                 continue;
             }
 
-            let mut mem_counters = PROCESS_MEMORY_COUNTERS::default();
-            mem_counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            let mut mem_counters = PROCESS_MEMORY_COUNTERS {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
             if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err()
             {
                 warn!("Failed to get memory info for PID {}", pid);
