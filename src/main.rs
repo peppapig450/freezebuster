@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let log_path = "service.log";
     setup_logging(log_path)?;
 
-    info!("FreezeBusterService starting with config: {:?}", config);
+    info!("FreezeBusterService starting with config: {config:?}");
 
     // Start the service
     service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Service logic
 fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
     if let Err(e) = run_service(arguments) {
-        error!("Service failed: {}", e);
+        error!("Service failed: {e}");
     }
 }
 
@@ -111,7 +111,7 @@ fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
     };
 
     unsafe {
-        AdjustTokenPrivileges(token, false, Some(&tp as *const _), 0, None, None)?;
+        AdjustTokenPrivileges(token, false, Some(&raw const tp), 0, None, None)?;
         CloseHandle(token)?;
     }
 
@@ -160,7 +160,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
             &mut system_processes,
             &mut first_run,
         ) {
-            error!("Monitoring error: {}", e)
+            error!("Monitoring error: {e}");
         }
         let sleep_duration = adjust_sleep_duration();
         std::thread::sleep(sleep_duration);
@@ -251,7 +251,7 @@ fn adjust_sleep_duration() -> Duration {
         ..Default::default()
     };
     if unsafe { GlobalMemoryStatusEx(&mut mem_info) }.is_ok() {
-        let memory_load = mem_info.dwMemoryLoad as f64 / 100.0; // 0.0 to 1.0
+        let memory_load = f64::from(mem_info.dwMemoryLoad) / 100.0; // 0.0 to 1.0
         // Exponential decay: S = S_max * e^(-k * L)
         let sleep_secs = MAX_SLEEP_SECS * (-K * memory_load).exp();
         // Clamp between min and max sleep times
@@ -295,7 +295,7 @@ fn monitor_and_terminate(
                         system_processes.insert(pid, process_name.clone());
                     }
                 } else {
-                    error!("Failed to check process properties for PID: {}", pid);
+                    error!("Failed to check process properties for PID: {pid}");
                 }
             }
 
@@ -316,7 +316,7 @@ fn monitor_and_terminate(
             };
             if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err()
             {
-                warn!("Failed to get memory info for PID {}", pid);
+                warn!("Failed to get memory info for PID {pid}");
                 unsafe { CloseHandle(handle) }?;
                 if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                     break;
@@ -332,9 +332,9 @@ fn monitor_and_terminate(
                 if elapsed > Duration::from_secs(0) {
                     let delta_working_set = working_set.saturating_sub(data.prev_working_set);
                     let growth_mb_per_sec =
-                        (delta_working_set as f64 / (2 << 20) as f64) / elapsed.as_secs_f64();
+                        (delta_working_set as f64 / f64::from(2 << 20)) / elapsed.as_secs_f64();
                     let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
-                    let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
+                    let page_fault_rate = f64::from(delta_page_faults) / elapsed.as_secs_f64();
 
                     if available_memory_mb < config.min_available_memory_mb
                         && growth_mb_per_sec > config.max_working_set_growth_mb_per_sec
@@ -352,16 +352,15 @@ fn monitor_and_terminate(
                                         data.working_set_violations
                                     );
                                     if unsafe { TerminateProcess(handle, 1) }.is_err() {
-                                        error!("Failed to terminate PID {}", pid);
+                                        error!("Failed to terminate PID {pid}");
                                     }
                                 } else {
                                     warn!(
-                                        "Skipped termination of critical/system PID {} ({})",
-                                        pid, process_name
+                                        "Skipped termination of critical/system PID {pid} ({process_name})"
                                     );
                                 }
                             } else {
-                                error!("Failed to check process properties for PID: {}", pid);
+                                error!("Failed to check process properties for PID: {pid}");
                             }
                         }
                     } else {
@@ -381,16 +380,15 @@ fn monitor_and_terminate(
                                         data.page_fault_violations
                                     );
                                     if unsafe { TerminateProcess(handle, 1) }.is_err() {
-                                        error!("Failed to terminate PID {}", pid);
+                                        error!("Failed to terminate PID {pid}");
                                     }
                                 } else {
                                     warn!(
-                                        "Skipped termination of critical/system PID {} ({})",
-                                        pid, process_name
+                                        "Skipped termination of critical/system PID {pid} ({process_name})"
                                     );
                                 }
                             } else {
-                                error!("Failed to check process properties for PID: {}", pid);
+                                error!("Failed to check process properties for PID: {pid}");
                             }
                         }
                     } else {

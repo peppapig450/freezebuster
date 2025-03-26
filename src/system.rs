@@ -45,7 +45,7 @@ fn get_system_sid() -> Result<&'static [u8], Error> {
             CreateWellKnownSid(
                 WinLocalSystemSid,
                 None,
-                Some(PSID(sid.as_mut_ptr() as *mut c_void)),
+                Some(PSID(sid.as_mut_ptr().cast::<c_void>())),
                 &mut sid_size,
             )
             .expect("Failed to create SYSTEM SID");
@@ -62,7 +62,7 @@ fn get_system_sid() -> Result<&'static [u8], Error> {
         .as_slice())
 }
 
-/// Checks if a process is critical using IsProcessCritical.
+/// Checks if a process is critical using `IsProcessCritical`.
 ///
 /// # Safety
 /// - `process_handle` must be a valid handle with at least `PROCESS_QUERY_LIMITED_INFORMATION`.
