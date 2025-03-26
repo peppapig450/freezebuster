@@ -20,14 +20,14 @@ use windows::{
         },
         System::{
             Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                TH32CS_SNAPPROCESS,
+                CREATE_TOOLHELP_SNAPSHOT_FLAGS, CreateToolhelp32Snapshot, PROCESSENTRY32W,
+                Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
             },
             ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
             SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
             Threading::{
-                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
-                PROCESS_TERMINATE, TerminateProcess,
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
             },
         },
     },
@@ -70,7 +70,7 @@ struct ProcessData {
 pub trait WindowsApi {
     fn create_toolhelp32_snapshot(
         &self,
-        flags: u32,
+        flags: CREATE_TOOLHELP_SNAPSHOT_FLAGS,
         process_id: u32,
     ) -> Result<WinHandle, WinError>;
     fn process32_first_w(
@@ -85,7 +85,7 @@ pub trait WindowsApi {
     ) -> Result<(), WinError>;
     fn open_process(
         &self,
-        desired_access: u32,
+        desired_access: PROCESS_ACCESS_RIGHTS,
         inherit_handle: bool,
         process_id: u32,
     ) -> Result<WinHandle, WinError>;
@@ -94,10 +94,62 @@ pub trait WindowsApi {
         process: WinHandle,
         counters: &mut PROCESS_MEMORY_COUNTERS,
         size: u32,
-    ) -> Result<WinHandle, WinError>;
+    ) -> Result<(), WinError>;
     fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError>;
     fn close_handle(&self, handle: WinHandle) -> Result<(), WinError>;
     fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError>;
+}
+
+// Real implementation of the Windows API trait
+pub struct RealWindowsApi;
+
+impl WindowsApi for RealWindowsApi {
+    fn create_toolhelp32_snapshot(
+        &self,
+        flags: CREATE_TOOLHELP_SNAPSHOT_FLAGS,
+        process_id: u32,
+    ) -> Result<WinHandle, WinError> {
+        unsafe { CreateToolhelp32Snapshot(flags, process_id) }
+    }
+    fn process32_first_w(
+        &self,
+        snapshot: WinHandle,
+        entry: &mut PROCESSENTRY32W,
+    ) -> Result<(), WinError> {
+        unsafe { Process32FirstW(snapshot, entry).map(|_| ()) }
+    }
+    fn process32_next_w(
+        &self,
+        snapshot: WinHandle,
+        entry: &mut PROCESSENTRY32W,
+    ) -> Result<(), WinError> {
+        unsafe { Process32NextW(snapshot, entry).map(|_| ()) }
+    }
+    fn open_process(
+        &self,
+        desired_access: PROCESS_ACCESS_RIGHTS,
+        inherit_handle: bool,
+        process_id: u32,
+    ) -> Result<WinHandle, WinError> {
+        unsafe { OpenProcess(desired_access, inherit_handle, process_id) }
+    }
+    fn get_process_memory_info(
+        &self,
+        process: WinHandle,
+        counters: &mut PROCESS_MEMORY_COUNTERS,
+        size: u32,
+    ) -> Result<(), WinError> {
+        unsafe { GetProcessMemoryInfo(process, counters, size).map(|_| ()) }
+    }
+    fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError> {
+        unsafe { TerminateProcess(process, exit_code).map(|_| ()) }
+    }
+    fn close_handle(&self, handle: WinHandle) -> Result<(), WinError> {
+        unsafe { CloseHandle(handle).map(|_| ()) }
+    }
+    fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError> {
+        unsafe { GlobalMemoryStatusEx(mem_info).map(|_| ()) }
+    }
 }
 
 // Define the Windows service entry point
