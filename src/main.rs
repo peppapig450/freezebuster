@@ -428,7 +428,10 @@ fn monitor_and_terminate(
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
-    OsString::from_wide(wide).to_string_lossy().into_owned()
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    OsString::from_wide(&wide[..len])
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
