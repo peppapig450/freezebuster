@@ -107,7 +107,7 @@ unsafe fn is_system_process(process_handle: HANDLE) -> Result<bool, Error> {
     let token_user = unsafe { &*token_user_buf.as_ptr().cast::<TOKEN_USER>() };
     let sid = token_user.User.Sid;
 
-    let system_sid = get_system_sid();
+    let system_sid = get_system_sid()?;
     let is_system = unsafe { EqualSid(sid, PSID(system_sid.as_ptr() as *mut c_void)) };
 
     unsafe { CloseHandle(token_handle).ok() };
