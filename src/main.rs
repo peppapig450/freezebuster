@@ -1,18 +1,25 @@
-use std::collections::HashMap;
+mod system;
+
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs::File;
-use std::hash::Hash;
+use std::os::windows::ffi::OsStringExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Security::{
+    ConvertSid, ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
 };
+use crate::system::is_system_process;
 
 // For serialization:deserialization of the configuration
 use serde::Deserialize;
@@ -101,6 +108,8 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
 
     let mut process_data = HashMap::new();
     let total_memory = get_total_memory();
+    let mut system_processes = HashMap::new();
+    let mut first_run = true;
 }
 
 /// Reads the configuration from a JSON file
@@ -175,4 +184,41 @@ fn adjust_sleep_duration() -> Duration {
     } else {
         Duration::from_secs(5) // Default fallback if memory info unavailable
     }
+}
+
+/// Monitors processes and terminates them based on primary and fallback strategies.
+fn monitor_and_terminate(
+    config: &Config,
+    process_data: &mut HashMap<u32, ProcessData>,
+    _total_memory: u64,
+    now: Instant,
+    system_processes: &mut HashMap<u32, String>, // PID -> process name
+    first_run: &mut bool,
+) -> Result<(), Box<dyn Error>> {
+    let available_memory_mb = get_available_memory() >> 20;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
+    let mut entry = PROCESSENTRY32W::default();
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut current_pids = HashSet::new();
+
+    if unsafe { Process32First(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let pid = entry.th32ProcessID;
+            current_pids.insert(pid);
+            let process_name = wide_to_string(&entry.szExeFile).to_lowercase();
+
+            let handle =
+                unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, false, pid) }
+                    .map_err(|_| "Failed to open process")?;
+
+            // On first run, populate system_processes map
+            if *first_run && is_syst
+        }
+    } else {
+    }
+}
+
+
+fn wide_to_string(wide: &[u16]) -> String {
+    OsString::from_wide(wide).to_string_lossy().into_owned()
 }
