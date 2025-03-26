@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Security::LookupPrivilegeValueW;
+use windows::Win32::System::Diagnostics::ToolHelp::Process32FirstW;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
@@ -20,8 +21,7 @@ use windows::Win32::{
     },
     System::{
         Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32First, Process32Next,
-            TH32CS_SNAPPROCESS,
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32NextW, TH32CS_SNAPPROCESS,
         },
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
@@ -271,7 +271,7 @@ fn monitor_and_terminate(
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     let mut current_pids = HashSet::new();
 
-    if unsafe { Process32First(snapshot, &mut entry) }.is_ok() {
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
         loop {
             let pid = entry.th32ProcessID;
             current_pids.insert(pid);
@@ -282,8 +282,8 @@ fn monitor_and_terminate(
                     .map_err(|_| "Failed to open process")?;
 
             // On first run, populate system_processes map
-            if **first_run {
-                if let Ok(process_info) = check_process(process_handle) {
+            if *first_run {
+                if let Ok(process_info) = check_process(handle) {
                     if process_info.is_system || process_info.is_critical {
                         system_processes.insert(pid, process_name.clone());
                     }
@@ -293,22 +293,23 @@ fn monitor_and_terminate(
             }
 
             // Skip if in system_processes cache or whitelist
-            if system_processes.contains_key(&pid) || config.whitelist.binary_search(&process_name)
+            if system_processes.contains_key(&pid)
+                || config.whitelist.binary_search(&process_name).is_ok()
             {
-                unsafe { CloseHandle(hobject) }?;
-                if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
+                unsafe { CloseHandle(handle) }?;
+                if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                     break;
                 }
                 continue;
             }
 
             let mut mem_counters = PROCESS_MEMORY_COUNTERS::default();
-            mem_counters.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+            mem_counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
             if unsafe { GetProcessMemoryInfo(handle, &mut mem_counters, mem_counters.cb) }.is_err()
             {
                 warn!("Failed to get memory info for PID {}", pid);
                 unsafe { CloseHandle(handle) }?;
-                if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
+                if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                     break;
                 }
                 continue;
@@ -322,7 +323,7 @@ fn monitor_and_terminate(
                 if elapsed > Duration::from_secs(0) {
                     let delta_working_set = working_set.saturating_sub(data.prev_working_set);
                     let growth_mb_per_sec =
-                        (delta_working_set as f64 / (2 << 20)) / elapsed.as_secs_f64();
+                        (delta_working_set as f64 / (2 << 20) as f64) / elapsed.as_secs_f64();
                     let delta_page_faults = page_faults.saturating_sub(data.prev_page_faults);
                     let page_fault_rate = delta_page_faults as f64 / elapsed.as_secs_f64();
 
@@ -332,7 +333,7 @@ fn monitor_and_terminate(
                         data.working_set_violations += 1;
                         if data.working_set_violations >= config.violations_before_termination {
                             // Double-check ownership and critical status before termination
-                            if let Ok(process_info) = check_process(process_handle) {
+                            if let Ok(process_info) = check_process(handle) {
                                 if !process_info.is_critical && !process_info.is_system {
                                     info!(
                                         "Terminating PID {} ({}) due to excessive working set growth ({} MB/s) after {} violations",
@@ -361,7 +362,7 @@ fn monitor_and_terminate(
                     if page_fault_rate > config.max_page_faults_per_sec as f64 {
                         data.page_fault_violations += 1;
                         if data.page_fault_violations >= config.violations_before_termination {
-                            if let Ok(process_info) = check_process(process_handle) {
+                            if let Ok(process_info) = check_process(handle) {
                                 if !process_info.is_critical && !process_info.is_system {
                                     info!(
                                         "Terminating PID {} ({}) due to high page fault rate ({} faults/s) after {} violations",
@@ -404,14 +405,14 @@ fn monitor_and_terminate(
             }
 
             unsafe { CloseHandle(handle) }?;
-            if unsafe { Process32Next(snapshot, &mut entry) }.is_err() {
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                 break;
             }
         }
     }
 
-    if **first_run {
-        **first_run = false; // Mark first run as complete
+    if *first_run {
+        *first_run = false; // Mark first run as complete
     }
 
     process_data.retain(|&pid, _| current_pids.contains(&pid));
