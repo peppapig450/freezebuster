@@ -17,7 +17,7 @@ use windows::{
         Foundation::{CloseHandle, HANDLE as WinHandle, LUID},
         Security::{
             AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
-            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+            SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
         },
         System::{
             Diagnostics::ToolHelp::{
@@ -45,7 +45,7 @@ use windows_service::{
 };
 
 mod system;
-use crate::system::{ProcessInfo, check_process};
+use crate::system::check_process;
 
 /// Configuration structure loaded from config.json
 #[derive(Deserialize, Debug)]
@@ -99,6 +99,27 @@ pub trait WindowsApi {
     fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError>;
     fn close_handle(&self, handle: WinHandle) -> Result<(), WinError>;
     fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError>;
+    fn open_process_token(
+        &self,
+        process: WinHandle,
+        desired_access: TOKEN_ACCESS_MASK,
+        token_handle: &mut WinHandle,
+    ) -> Result<(), WinError>;
+    fn lookup_privilege_value_w(
+        &self,
+        system_name: Option<&str>,
+        name: PCWSTR,
+        luid: &mut LUID,
+    ) -> Result<(), WinError>;
+    fn adjust_token_privileges(
+        &self,
+        token_handle: WinHandle,
+        disable_all_privileges: bool,
+        new_state: Option<*const TOKEN_PRIVILEGES>,
+        buffer_length: u32,
+        previous_state: Option<*mut TOKEN_PRIVILEGES>,
+        return_length: Option<*mut u32>,
+    ) -> Result<(), WinError>;
 }
 
 // Real implementation of the Windows API trait
@@ -151,6 +172,43 @@ impl WindowsApi for RealWindowsApi {
     fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError> {
         unsafe { GlobalMemoryStatusEx(mem_info).map(|_| ()) }
     }
+    fn open_process_token(
+        &self,
+        process: WinHandle,
+        desired_access: TOKEN_ACCESS_MASK,
+        token_handle: &mut WinHandle,
+    ) -> Result<(), WinError> {
+        unsafe { OpenProcessToken(process, desired_access, token_handle).map(|_| ()) }
+    }
+    fn lookup_privilege_value_w(
+        &self,
+        _system_name: Option<&str>,
+        name: PCWSTR,
+        luid: &mut LUID,
+    ) -> Result<(), WinError> {
+        unsafe { LookupPrivilegeValueW(None, name, luid).map(|_| ()) }
+    }
+    fn adjust_token_privileges(
+        &self,
+        token_handle: WinHandle,
+        disable_all_privileges: bool,
+        new_state: Option<*const TOKEN_PRIVILEGES>,
+        buffer_length: u32,
+        previous_state: Option<*mut TOKEN_PRIVILEGES>,
+        return_length: Option<*mut u32>,
+    ) -> Result<(), WinError> {
+        unsafe {
+            AdjustTokenPrivileges(
+                token_handle,
+                disable_all_privileges,
+                new_state,
+                buffer_length,
+                previous_state,
+                return_length,
+            )
+            .map(|_| ())
+        }
+    }
 }
 
 // Service context holding the API and configuration
@@ -160,8 +218,11 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
-    fn new(api: Box<dyn WindowsApi>, config: Config) -> Self {
-        ServiceContext { api, config }
+    fn new(api: Box<dyn WindowsApi>, config_path: &str) -> Result<Self, Box<dyn Error>> {
+        Ok(ServiceContext {
+            api,
+            config: read_config(config_path)?,
+        })
     }
 }
 
@@ -254,16 +315,16 @@ fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
     }
 }
 
-fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
+fn enable_se_debug_privilege(ctx: &ServiceContext) -> Result<(), Box<dyn Error>> {
     let mut token: WinHandle = WinHandle(std::ptr::null_mut());
     unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
+        ctx.api
+            .open_process_token(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token)?;
     }
 
     let mut luid: LUID = unsafe { std::mem::zeroed() };
-    unsafe {
-        LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
-    }
+    ctx.api
+        .lookup_privilege_value_w(None, SE_DEBUG_NAME, &mut luid)?;
 
     let tp = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
@@ -273,10 +334,9 @@ fn enable_se_debug_privilege() -> Result<(), Box<dyn Error>> {
         }],
     };
 
-    unsafe {
-        AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)?;
-        CloseHandle(token)?;
-    }
+    ctx.api
+        .adjust_token_privileges(token, false, Some(&tp), 0, None, None)?;
+    ctx.api.close_handle(token)?;
 
     Ok(())
 }
@@ -465,10 +525,9 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
 }
 
 fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
-    let config = read_config("config.json")?;
     let api = Box::new(RealWindowsApi);
-    let ctx = ServiceContext::new(api, config);
-    enable_se_debug_privilege()?;
+    let ctx = ServiceContext::new(api, "config.json")?;
+    enable_se_debug_privilege(&ctx)?;
 
     // Allocate stop on the heap and leak it to give it a 'static lifetime
     let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
@@ -532,15 +591,19 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Read configuration from config.json
     let config_path = "config.json";
-    let config = read_config(config_path)?;
 
     // Initialize logging to service.log
     let log_path = "service.log";
     setup_logging(log_path)?;
 
-    info!("FreezeBusterService starting with config: {config:?}");
+    let api = Box::new(RealWindowsApi);
+    let ctx = ServiceContext::new(api, config_path)?;
+
+    info!(
+        "FreezeBusterService starting with config: {0:?}",
+        ctx.config
+    );
 
     // Start the service
     service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
