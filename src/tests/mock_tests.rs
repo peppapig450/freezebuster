@@ -1,18 +1,15 @@
 #[cfg(test)]
 mod mock_tests {
-    use crate::{Config, ProcessData, ServiceContext, WindowsApi, adjust_sleep_duration};
-    use crate::{
-        enable_se_debug_privilege, get_available_memory, get_total_memory, monitor_and_terminate,
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
     };
+
     use mockall::mock;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
     use windows::{
         Win32::{
             Foundation::{HANDLE as WinHandle, LUID},
-            Security::{
-                TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-            },
+            Security::{TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES},
             System::{
                 Diagnostics::ToolHelp::{CREATE_TOOLHELP_SNAPSHOT_FLAGS, PROCESSENTRY32W},
                 ProcessStatus::PROCESS_MEMORY_COUNTERS,
@@ -21,6 +18,11 @@ mod mock_tests {
             },
         },
         core::{Error as WinError, PCWSTR},
+    };
+
+    use crate::{
+        Config, ProcessData, ServiceContext, WindowsApi, adjust_sleep_duration,
+        enable_se_debug_privilege, get_available_memory, get_total_memory, monitor_and_terminate,
     };
 
     // SafeHandle wrapper
@@ -88,6 +90,8 @@ mod mock_tests {
                 max_page_faults_per_sec: 1000,
                 violations_before_termination: 3,
                 whitelist: vec![],
+                log_file_path: "log.txt".to_string(),
+                log_level: "info".to_string(),
             },
         };
         let duration = adjust_sleep_duration(&ctx);
@@ -115,6 +119,8 @@ mod mock_tests {
                 max_page_faults_per_sec: 1000,
                 violations_before_termination: 3,
                 whitelist: vec![],
+                log_file_path: "log.txt".to_string(),
+                log_level: "info".to_string(),
             },
         };
         assert_eq!(get_total_memory(&ctx), 8_589_934_592);
@@ -134,6 +140,8 @@ mod mock_tests {
                 max_page_faults_per_sec: 1000,
                 violations_before_termination: 3,
                 whitelist: vec![],
+                log_file_path: "log.txt".to_string(),
+                log_level: "info".to_string(),
             },
         };
         assert_eq!(get_available_memory(&ctx), 0);
@@ -194,6 +202,8 @@ mod mock_tests {
                 max_page_faults_per_sec: 1000,
                 violations_before_termination: 3,
                 whitelist: vec![],
+                log_file_path: "log.txt".to_string(),
+                log_level: "info".to_string(),
             },
         };
         let result = enable_se_debug_privilege(&ctx);
@@ -240,6 +250,8 @@ mod mock_tests {
             max_page_faults_per_sec: 1000,
             violations_before_termination: 3,
             whitelist: vec!["notepad.exe".to_string()],
+            log_file_path: "log.txt".to_string(),
+            log_level: "info".to_string(),
         };
         let ctx = ServiceContext {
             api: Box::new(mock_api),
@@ -311,6 +323,8 @@ mod mock_tests {
             max_page_faults_per_sec: 1000,
             violations_before_termination: 1,
             whitelist: vec![],
+            log_file_path: "log.txt".to_string(),
+            log_level: "info".to_string(),
         };
         let ctx = ServiceContext {
             api: Box::new(mock_api),

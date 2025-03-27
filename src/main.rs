@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     ffi::OsString,
-    fs::File,
+    fs::{self, File},
     os::windows::ffi::OsStringExt,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
@@ -65,6 +65,10 @@ pub struct Config {
     violations_before_termination: u32,
     /// List of process names (case-insensitive) exempt from termination.
     whitelist: Vec<String>,
+    /// Path to the log file for service output.
+    log_file_path: String,
+    /// Log level (e.g., "debug", "info", "warn", "error", "off").
+    log_level: String,
 }
 
 /// Stores historical resource usage data for a process.
@@ -257,19 +261,16 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
-    /// Creates a new `ServiceContext` with the given API and configuration file path.
+    /// Creates a new `ServiceContext` with the specified API and configuration.
     ///
     /// # Arguments
-    /// * `api` - A boxed trait object implementing `WindowsApi`.
-    /// * `config_path` - Path to the JSON configuration file.
+    /// * `api` - A boxed trait object implementing `WindowsApi` for system calls.
+    /// * `config` - The configuration defining monitoring thresholds and rules.
     ///
     /// # Errors
-    /// Returns an error if the configuration file cannot be read or parsed.
-    fn new(api: Box<dyn WindowsApi>, config_path: &str) -> Result<Self, Box<dyn Error>> {
-        Ok(ServiceContext {
-            api,
-            config: read_config(config_path)?,
-        })
+    /// Returns an error if the configuration is invalid.
+    fn new(api: Box<dyn WindowsApi>, config: Config) -> Result<Self, Box<dyn Error>> {
+        Ok(ServiceContext { api, config })
     }
 }
 
@@ -337,18 +338,30 @@ fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
 
 /// Sets up file logging with RFC 3339 timestamps.
 ///
+/// Creates the log file directory if it does not exist and initializes the logger.
+///
 /// # Arguments
 /// * `log_file` - Path to the log file.
+/// * `log_level` - Logging level (e.g., `LevelFilter::Info`).
 ///
 /// # Errors
 /// Returns an error if the log file cannot be created or logging initialization fails.
-fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
+fn setup_logging(log_file: &str, log_level: LevelFilter) -> Result<(), Box<dyn Error>> {
+    let log_path = PathBuf::from(log_file);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let config = ConfigBuilder::new().set_time_format_rfc3339().build();
     CombinedLogger::init(vec![WriteLogger::new(
-        LevelFilter::Warn,
+        log_level,
         config,
         File::create(log_file)?,
     )])?;
+    info!(
+        "Logging initialized at {} with level {:?}",
+        log_path.display(),
+        log_level
+    );
     Ok(())
 }
 
@@ -669,15 +682,33 @@ fn freeze_buster_service(arguments: Vec<OsString>) {
 
 /// Runs the service, managing process monitoring and termination.
 ///
+/// Initializes the service context, sets up logging, and runs the monitoring loop until stopped.
+///
 /// # Arguments
-/// * `arguments` - Command-line arguments (currently unused).
+/// * `arguments` - Command-line arguments, where the first argument can specify a config file path.
 ///
 /// # Errors
-/// Returns an error if service initialization or execution fails.
+/// Returns an error if service initialization, logging setup, or execution fails.
 fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
-    let api = Box::new(RealWindowsApi);
     let config_path = get_config_path(&arguments)?;
-    let ctx = ServiceContext::new(api, &config_path)?;
+    let config = read_config(&config_path)?;
+
+    let log_level = match config.log_level.to_lowercase().as_str() {
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "trace" => LevelFilter::Trace,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "off" => LevelFilter::Off,
+        other => return Err(format!("Invalid log level: {}", other).into()),
+    };
+
+    setup_logging(&config.log_file_path, log_level)?;
+
+    info!("Using config from {}", config_path);
+
+    let api = Box::new(RealWindowsApi);
+    let ctx = ServiceContext::new(api, config)?;
     enable_se_debug_privilege(&ctx)?;
 
     // Allocate stop on the heap and leak it to give it a 'static lifetime
@@ -743,25 +774,11 @@ fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
 
 /// Entry point for the `FreezeBusterService`.
 ///
-/// Initializes logging and starts the service dispatcher.
+/// Starts the Windows service dispatcher for "FreezeBusterService".
 ///
 /// # Errors
-/// Returns an error if logging setup or service startup fails.
+/// Returns an error if the service dispatcher fails to start.
 fn main() -> Result<(), Box<dyn Error>> {
-    let config_path = "config.json";
-
-    // Initialize logging to service.log
-    let log_path = "service.log";
-    setup_logging(log_path)?;
-
-    let api = Box::new(RealWindowsApi);
-    let ctx = ServiceContext::new(api, config_path)?;
-
-    info!(
-        "FreezeBusterService starting with config: {0:?}",
-        ctx.config
-    );
-
     // Start the service
     service_dispatcher::start("FreezeBusterService", ffi_service_main)?;
     Ok(())
@@ -792,7 +809,9 @@ mod tests {
                 "min_available_memory_mb": 512,
                 "max_page_faults_per_sec": 1000,
                 "violations_before_termination": 3,
-                "whitelist": ["notepad.exe", "explorer.exe"]
+                "whitelist": ["notepad.exe", "explorer.exe"],
+                "log_file_path": "log.txt",
+                "log_level": "info"
             }
         "#;
         let (_dir, path) = create_temp_config(config_json);
@@ -806,6 +825,8 @@ mod tests {
         assert_eq!(config.max_page_faults_per_sec, 1000);
         assert_eq!(config.violations_before_termination, 3);
         assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]); // Note: sorted and lowercase
+        assert_eq!(config.log_file_path, "log.txt");
+        assert_eq!(config.log_level, "info");
     }
 
     #[test]
@@ -835,21 +856,22 @@ mod tests {
 
     #[test]
     fn test_service_context_new_valid() {
-        let config_json = r#"
-        {
-            "max_working_set_growth_mb_per_sec": 10.0,
-            "min_available_memory_mb": 512,
-            "max_page_faults_per_sec": 1000,
-            "violations_before_termination": 3,
-            "whitelist": ["Notepad.EXE"]
-        }
-    "#;
-        let (_dir, path) = create_temp_config(config_json);
-        let api = Box::new(RealWindowsApi); // Real API for initialization test
-        let result = ServiceContext::new(api, &path);
+        let config = Config {
+            max_working_set_growth_mb_per_sec: 10.0,
+            min_available_memory_mb: 512,
+            max_page_faults_per_sec: 1000,
+            violations_before_termination: 3,
+            whitelist: vec!["Notepad.EXE".to_string().to_lowercase()],
+            log_file_path: "log.txt".to_string(),
+            log_level: "info".to_string(),
+        };
+        let api = Box::new(RealWindowsApi);
+        let result = ServiceContext::new(api, config);
         assert!(result.is_ok());
         let ctx = result.unwrap();
         assert_eq!(ctx.config.whitelist, vec!["notepad.exe"]); // Check case conversion and sorting
+        assert_eq!(ctx.config.log_file_path, "log.txt");
+        assert_eq!(ctx.config.log_level, "info");
     }
 
     #[test]
@@ -877,6 +899,11 @@ mod tests {
             /* expected default */ 3
         );
         assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+        assert_eq!(
+            config.log_file_path,
+            "C:\\ProgramData\\FreezeBuster\\service.log"
+        );
+        assert_eq!(config.log_level, "warn");
     }
 
     #[test]
@@ -887,7 +914,9 @@ mod tests {
             "min_available_memory_mb": 512,
             "max_page_faults_per_sec": 1000,
             "violations_before_termination": 3,
-            "whitelist": ["Notepad.EXE", "EXPLORER.exe"]
+            "whitelist": ["Notepad.EXE", "EXPLORER.exe"],
+            "log_file_path": "log.txt",
+            "log_level": "info"
         }
     "#;
         let (_dir, path) = create_temp_config(config_json);
@@ -904,12 +933,16 @@ mod tests {
             "min_available_memory_mb": 512,
             "max_page_faults_per_sec": 1000,
             "violations_before_termination": 3,
-            "whitelist": []
+            "whitelist": [],
+            "log_file_path": "log.txt",
+            "log_level": "info"
         }
     "#;
         let config = serde_json::from_str(default_config).expect("Default config should be valid");
         let Config { whitelist, .. } = config;
-        assert_eq!(whitelist, Vec::<String>::new()); // Empty whitelist is valid
+        assert_eq!(whitelist, Vec::<String>::new());
+        assert_eq!(config.log_file_path, "log.txt");
+        assert_eq!(config.log_level, "info");
     }
 
     #[test]
@@ -920,7 +953,9 @@ mod tests {
             "min_available_memory_mb": 512,
             "max_page_faults_per_sec": 1000,
             "violations_before_termination": 3,
-            "whitelist": []
+            "whitelist": [],
+            "log_file_path": "log.txt",
+            "log_level": "info"
         }
     "#;
         let (_dir, path) = create_temp_config(config_json);
