@@ -47,70 +47,107 @@ use windows_service::{
 mod system;
 use crate::system::check_process;
 
-/// Configuration structure loaded from config.json
+/// Configuration structure loaded from `config.json`.
+///
+/// Defines thresholds and rules for process monitoring and termination.
 #[derive(Deserialize, Debug)]
 struct Config {
-    max_working_set_growth_mb_per_sec: f64, // Max growth rate of working set (MB/sec)
-    min_available_memory_mb: u64,           // Minimum available physical memory (MB)
+    /// Maximum allowed working set growth rate in megabytes per second (MB/s).
+    max_working_set_growth_mb_per_sec: f64,
+    /// Minimum available physical memory in megabytes (MB) before termination is considered.
+    min_available_memory_mb: u64,
+    /// Maximum allowed page faults per second.
     max_page_faults_per_sec: u64,
+    /// Number of consecutive violations before a process is terminated.
     violations_before_termination: u32,
+    /// List of process names (case-insensitive) exempt from termination.
     whitelist: Vec<String>,
 }
 
-/// Process data for tracking resource usage over time
+/// Stores historical resource usage data for a process.
+///
+/// Used to track memory growth and page faults over time.
 #[derive(Debug)]
 struct ProcessData {
-    prev_working_set: u64, // Previous working set size (bytes)
-    prev_time: Instant,    // Time of last measurement
+    /// Previous working set size in bytes.
+    prev_working_set: u64,
+    /// Timestamp of the last measurement.
+    prev_time: Instant,
+    /// Previous page fault count.
     prev_page_faults: u32,
+    /// Number of working set growth violations.
     working_set_violations: u32,
+    /// Number of page fault rate violations.
     page_fault_violations: u32,
 }
 
-// Trait for abstracting Windows API calls
+/// Trait for abstracting Windows API calls.
+///
+/// Provides a mockable interface for system calls, enabling unit testing and dependency injection.
 pub trait WindowsApi {
+    /// Creates a snapshot of running processes.
     fn create_toolhelp32_snapshot(
         &self,
         flags: CREATE_TOOLHELP_SNAPSHOT_FLAGS,
         process_id: u32,
     ) -> Result<WinHandle, WinError>;
+
+    /// Retrieves the first process entry from a snapshot.
     fn process32_first_w(
         &self,
         snapshot: WinHandle,
         entry: &mut PROCESSENTRY32W,
     ) -> Result<(), WinError>;
+
+    /// Retrieves the next process entry from a snapshot.
     fn process32_next_w(
         &self,
         snapshot: WinHandle,
         entry: &mut PROCESSENTRY32W,
     ) -> Result<(), WinError>;
+
+    /// Opens a handle to a process with specified access rights.
     fn open_process(
         &self,
         desired_access: PROCESS_ACCESS_RIGHTS,
         inherit_handle: bool,
         process_id: u32,
     ) -> Result<WinHandle, WinError>;
+
+    /// Retrieves memory usage information for a process.
     fn get_process_memory_info(
         &self,
         process: WinHandle,
         counters: &mut PROCESS_MEMORY_COUNTERS,
         size: u32,
     ) -> Result<(), WinError>;
+
+    /// Terminates a process with the specified exit code.
     fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError>;
+
+    /// Closes an open handle.
     fn close_handle(&self, handle: WinHandle) -> Result<(), WinError>;
+
+    /// Retrieves system-wide memory status.
     fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError>;
+
+    /// Opens a token for a process with specified access rights.
     fn open_process_token(
         &self,
         process: WinHandle,
         desired_access: TOKEN_ACCESS_MASK,
         token_handle: &mut WinHandle,
     ) -> Result<(), WinError>;
+
+    /// Looks up the LUID for a privilege name.
     fn lookup_privilege_value_w(
         &self,
         system_name: Option<&str>,
         name: PCWSTR,
         luid: &mut LUID,
     ) -> Result<(), WinError>;
+
+    /// Adjusts privileges on a process token.
     fn adjust_token_privileges(
         &self,
         token_handle: WinHandle,
@@ -122,7 +159,7 @@ pub trait WindowsApi {
     ) -> Result<(), WinError>;
 }
 
-// Real implementation of the Windows API trait
+/// Real implementation of the `WindowsApi` trait using actual Windows API calls.
 pub struct RealWindowsApi;
 
 impl WindowsApi for RealWindowsApi {
@@ -218,6 +255,14 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
+    /// Creates a new `ServiceContext` with the given API and configuration file path.
+    ///
+    /// # Arguments
+    /// * `api` - A boxed trait object implementing `WindowsApi`.
+    /// * `config_path` - Path to the JSON configuration file.
+    ///
+    /// # Errors
+    /// Returns an error if the configuration file cannot be read or parsed.
     fn new(api: Box<dyn WindowsApi>, config_path: &str) -> Result<Self, Box<dyn Error>> {
         Ok(ServiceContext {
             api,
@@ -226,8 +271,15 @@ impl ServiceContext {
     }
 }
 
-// Utility functions
-/// Reads the configuration from a JSON file
+/// Reads the configuration from a JSON file.
+///
+/// Converts whitelist entries to lowercase for case-insensitive matching and sorts them for binary search.
+///
+/// # Arguments
+/// * `path` - Path to the configuration file.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or the JSON is invalid.
 fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
     let file = File::open(path)?;
     let mut config: Config = serde_json::from_reader(file)?;
@@ -241,7 +293,13 @@ fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
-/// Sets up file logging with timestamps
+/// Sets up file logging with RFC 3339 timestamps.
+///
+/// # Arguments
+/// * `log_file` - Path to the log file.
+///
+/// # Errors
+/// Returns an error if the log file cannot be created or logging initialization fails.
 fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
     let config = ConfigBuilder::new().set_time_format_rfc3339().build();
     CombinedLogger::init(vec![WriteLogger::new(
@@ -252,6 +310,12 @@ fn setup_logging(log_file: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Converts a wide-character (UTF-16) string to a Rust `String`.
+///
+/// Truncates at the first null character if present.
+///
+/// # Arguments
+/// * `wide` - Slice of UTF-16 code units.
 fn wide_to_string(wide: &[u16]) -> String {
     let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     OsString::from_wide(&wide[..len])
@@ -261,7 +325,11 @@ fn wide_to_string(wide: &[u16]) -> String {
 
 /// Retrieves the total physical memory in bytes.
 ///
-/// Returns 0 if the call fails, logging an error.
+/// # Arguments
+/// * `ctx` - Service context containing the API.
+///
+/// # Returns
+/// Total memory in bytes, or 0 if the call fails (with an error logged)
 fn get_total_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -277,7 +345,11 @@ fn get_total_memory(ctx: &ServiceContext) -> u64 {
 
 /// Retrieves the available physical memory in bytes.
 ///
-/// Returns 0 if the call fails, logging an error.
+/// # Arguments
+/// * `ctx` - Service context containing the API.
+///
+/// # Returns
+/// Available memory in bytes, or 0 if the call fails (with an error logged).
 fn get_available_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -291,10 +363,15 @@ fn get_available_memory(ctx: &ServiceContext) -> u64 {
     }
 }
 
-/// Adjusts sleep duration using exponential scaling based on memory load.
+/// Adjusts sleep duration based on system memory load using exponential scaling.
 ///
-/// Sleep time decreases exponentially as memory load increases, ensuring rapid response
-/// during high pressure and reduced overhead during low pressure.
+/// Sleep time decreases as memory load increases, ensuring faster response during high load.
+///
+/// # Arguments
+/// * `ctx` - Service context containing the API.
+///
+/// # Returns
+/// A `Duration` between 0.1s and 30s, or 5s if memory info is unavailable.
 fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
     const MAX_SLEEP_SECS: f64 = 30.0; // Maximum sleep time at 0% load
     const MIN_SLEEP_SECS: f64 = 0.1; // Minimum sleep time at 100% load
@@ -315,6 +392,15 @@ fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
     }
 }
 
+/// Enables the SE_DEBUG_NAME privilege for the current process.
+///
+/// Required to access detailed information about all processes.
+///
+/// # Arguments
+/// * `ctx` - Service context containing the API.
+///
+/// # Errors
+/// Returns an error if privilege adjustment fails.
 fn enable_se_debug_privilege(ctx: &ServiceContext) -> Result<(), Box<dyn Error>> {
     let mut token: WinHandle = WinHandle(std::ptr::null_mut());
     unsafe {
@@ -341,7 +427,22 @@ fn enable_se_debug_privilege(ctx: &ServiceContext) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-/// Monitors processes and terminates them based on primary and fallback strategies.
+/// Monitors and terminates processes exceeding resource usage thresholds.
+///
+/// This function takes a snapshot of running processes, tracks their memory usage and page faults,
+/// and terminates those that violate configured limits after a specified number of violations.
+/// System and whitelisted processes are skipped.
+///
+/// # Arguments
+/// * `ctx` - The service context containing the API and configuration.
+/// * `process_data` - A map of process IDs to their historical data.
+/// * `total_memory` - Total physical memory (currently unused).
+/// * `now` - The current time for calculating growth rates.
+/// * `system_processes` - A map of system process IDs to their names.
+/// * `first_run` - Flag indicating if this is the initial monitoring cycle.
+///
+/// # Errors
+/// Returns an error if any Windows API call fails.
 fn monitor_and_terminate(
     ctx: &ServiceContext,
     process_data: &mut HashMap<u32, ProcessData>,
@@ -512,18 +613,25 @@ fn monitor_and_terminate(
     Ok(())
 }
 
-// Service implementation
-
 // Define the Windows service entry point
 define_windows_service!(ffi_service_main, freeze_buster_service);
 
-/// Service logic
+/// Main service logic for FreezeBusterService.
+///
+/// Handles service lifecycle and delegates to `run_service`.
 fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
     if let Err(e) = run_service(arguments) {
         error!("Service failed: {e}");
     }
 }
 
+/// Runs the service, managing process monitoring and termination.
+///
+/// # Arguments
+/// * `arguments` - Command-line arguments (currently unused).
+///
+/// # Errors
+/// Returns an error if service initialization or execution fails.
 fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
     let api = Box::new(RealWindowsApi);
     let ctx = ServiceContext::new(api, "config.json")?;
@@ -590,6 +698,12 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+/// Entry point for the FreezeBusterService.
+///
+/// Initializes logging and starts the service dispatcher.
+///
+/// # Errors
+/// Returns an error if logging setup or service startup fails.
 fn main() -> Result<(), Box<dyn Error>> {
     let config_path = "config.json";
 
