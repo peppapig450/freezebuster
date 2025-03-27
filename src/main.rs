@@ -4,6 +4,7 @@ use std::{
     ffi::OsString,
     fs::File,
     os::windows::ffi::OsStringExt,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -46,6 +47,8 @@ use windows_service::{
 
 mod system;
 use crate::system::check_process;
+
+const DEFAULT_CONFIG: &str = include_str!("../default_config.json");
 
 /// Configuration structure loaded from `config.json`.
 ///
@@ -270,18 +273,58 @@ impl ServiceContext {
     }
 }
 
+/// Retrieves the directory containing the current executable.
+///
+/// # Errors
+/// Returns an error if the executable path cannot be determined or has no parent directory.
+fn get_exe_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let exe_path = std::env::current_exe()?;
+    Ok(exe_path
+        .parent()
+        .ok_or("No parent directory for executable")?
+        .to_path_buf())
+}
+
+/// Determines the path to the configuration file.
+///
+/// Uses the first command-line argument if provided, otherwise defaults to "config.json"
+/// in the executable's directory.
+///
+/// # Arguments
+/// * `arguments` - Slice of command-line arguments as `OsString`s.
+///
+/// # Errors
+/// Returns an error if the executable directory cannot be determined when using the default path.
+fn get_config_path(arguments: &[OsString]) -> Result<String, Box<dyn Error>> {
+    if arguments.len() > 1 {
+        Ok(arguments[1].to_string_lossy().into_owned())
+    } else {
+        Ok(get_exe_dir()?
+            .join("config.json")
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
 /// Reads the configuration from a JSON file.
 ///
 /// Converts whitelist entries to lowercase for case-insensitive matching and sorts them for binary search.
+/// Falls back to an embedded default configuration if the file at `path` cannot be opened.
 ///
 /// # Arguments
 /// * `path` - Path to the configuration file.
 ///
 /// # Errors
-/// Returns an error if the file cannot be opened or the JSON is invalid.
+/// Returns an error if the file cannot be opened and the embedded default JSON is invalid.
 fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
-    let file = File::open(path)?;
-    let mut config: Config = serde_json::from_reader(file)?;
+    let mut config: Config = if let Ok(file) = File::open(path) {
+        info!("Loaded config from {}", path);
+        serde_json::from_reader(file)?
+    } else {
+        info!("File {} not found, using embedded default config", path);
+        serde_json::from_str(DEFAULT_CONFIG)?
+    };
+
     // Convert whitelist to lowercase for case-insensitive comparison
     config.whitelist = config
         .whitelist
@@ -329,7 +372,7 @@ fn wide_to_string(wide: &[u16]) -> String {
 ///
 /// # Returns
 /// Total memory in bytes, or 0 if the call fails (with an error logged)
-#[must_use] pub fn get_total_memory(ctx: &ServiceContext) -> u64 {
+pub fn get_total_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -618,7 +661,7 @@ define_windows_service!(ffi_service_main, freeze_buster_service);
 /// Main service logic for `FreezeBusterService`.
 ///
 /// Handles service lifecycle and delegates to `run_service`.
-fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
+fn freeze_buster_service(arguments: Vec<OsString>) {
     if let Err(e) = run_service(arguments) {
         error!("Service failed: {e}");
     }
@@ -631,9 +674,10 @@ fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
 ///
 /// # Errors
 /// Returns an error if service initialization or execution fails.
-fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
+fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let api = Box::new(RealWindowsApi);
-    let ctx = ServiceContext::new(api, "config.json")?;
+    let config_path = get_config_path(&arguments)?;
+    let ctx = ServiceContext::new(api, &config_path)?;
     enable_se_debug_privilege(&ctx)?;
 
     // Allocate stop on the heap and leak it to give it a 'static lifetime
@@ -727,7 +771,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use std::{fs::File, io::Write};
 
-    
     use tempfile::TempDir;
 
     use super::*;
@@ -810,9 +853,101 @@ mod tests {
     }
 
     #[test]
-    fn test_read_config_missing_file() {
-        let result = read_config("non_existent_config.json");
-        assert!(result.is_err());
+    fn test_read_config_fallback_to_default() {
+        let path = "non_existent_config.json";
+        let result = read_config(path);
+        assert!(result.is_ok(), "Should fall back to default config");
+        let config = result.unwrap();
+        // Assuming DEFAULT_CONFIG is valid JSON in your project
+        // Replace these with actual values from your DEFAULT_CONFIG
+        assert_eq!(
+            config.max_working_set_growth_mb_per_sec,
+            /* expected default */ 10.0
+        );
+        assert_eq!(
+            config.min_available_memory_mb,
+            /* expected default */ 500
+        );
+        assert_eq!(
+            config.max_page_faults_per_sec,
+            /* expected default */ 1000
+        );
+        assert_eq!(
+            config.violations_before_termination,
+            /* expected default */ 3
+        );
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+    }
+
+    #[test]
+    fn test_read_config_whitelist_case_insensitivity() {
+        let config_json = r#"
+        {
+            "max_working_set_growth_mb_per_sec": 10.0,
+            "min_available_memory_mb": 512,
+            "max_page_faults_per_sec": 1000,
+            "violations_before_termination": 3,
+            "whitelist": ["Notepad.EXE", "EXPLORER.exe"]
+        }
+    "#;
+        let (_dir, path) = create_temp_config(config_json);
+        let config = read_config(&path).unwrap();
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+    }
+
+    #[test]
+    fn test_default_config_validity() {
+        // Temporarily override DEFAULT_CONFIG for this test if needed
+        let default_config = r#"
+        {
+            "max_working_set_growth_mb_per_sec": 10.0,
+            "min_available_memory_mb": 512,
+            "max_page_faults_per_sec": 1000,
+            "violations_before_termination": 3,
+            "whitelist": []
+        }
+    "#;
+        let config = serde_json::from_str(default_config).expect("Default config should be valid");
+        let Config { whitelist, .. } = config;
+        assert_eq!(whitelist, Vec::<String>::new()); // Empty whitelist is valid
+    }
+
+    #[test]
+    fn test_read_config_invalid_types() {
+        let config_json = r#"
+        {
+            "max_working_set_growth_mb_per_sec": "invalid",
+            "min_available_memory_mb": 512,
+            "max_page_faults_per_sec": 1000,
+            "violations_before_termination": 3,
+            "whitelist": []
+        }
+    "#;
+        let (_dir, path) = create_temp_config(config_json);
+        let result = read_config(&path);
+        assert!(result.is_err(), "Invalid type should fail");
+    }
+
+    #[test]
+    fn test_get_config_path_from_args() {
+        let args = vec![
+            OsString::from("freezebuster.exe"),
+            OsString::from("C:\\custom\\config.json"),
+        ];
+        let path = get_config_path(&args).unwrap();
+        assert_eq!(path, "C:\\custom\\config.json");
+    }
+
+    #[test]
+    fn test_get_config_path_default() {
+        let args = vec![OsString::from("freezebuster.exe")];
+        let path = get_config_path(&args).unwrap();
+        assert!(
+            path.ends_with("config.json"),
+            "Path should end with 'config.json': {}",
+            path
+        );
+        assert!(!path.is_empty(), "Path should not be empty");
     }
 
     #[test]
