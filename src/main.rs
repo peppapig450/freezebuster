@@ -175,14 +175,14 @@ impl WindowsApi for RealWindowsApi {
         snapshot: WinHandle,
         entry: &mut PROCESSENTRY32W,
     ) -> Result<(), WinError> {
-        unsafe { Process32FirstW(snapshot, entry).map(|_| ()) }
+        unsafe { Process32FirstW(snapshot, entry) }
     }
     fn process32_next_w(
         &self,
         snapshot: WinHandle,
         entry: &mut PROCESSENTRY32W,
     ) -> Result<(), WinError> {
-        unsafe { Process32NextW(snapshot, entry).map(|_| ()) }
+        unsafe { Process32NextW(snapshot, entry) }
     }
     fn open_process(
         &self,
@@ -198,16 +198,16 @@ impl WindowsApi for RealWindowsApi {
         counters: &mut PROCESS_MEMORY_COUNTERS,
         size: u32,
     ) -> Result<(), WinError> {
-        unsafe { GetProcessMemoryInfo(process, counters, size).map(|_| ()) }
+        unsafe { GetProcessMemoryInfo(process, counters, size) }
     }
     fn terminate_process(&self, process: WinHandle, exit_code: u32) -> Result<(), WinError> {
-        unsafe { TerminateProcess(process, exit_code).map(|_| ()) }
+        unsafe { TerminateProcess(process, exit_code) }
     }
     fn close_handle(&self, handle: WinHandle) -> Result<(), WinError> {
-        unsafe { CloseHandle(handle).map(|_| ()) }
+        unsafe { CloseHandle(handle) }
     }
     fn global_memory_status_ex(&self, mem_info: &mut MEMORYSTATUSEX) -> Result<(), WinError> {
-        unsafe { GlobalMemoryStatusEx(mem_info).map(|_| ()) }
+        unsafe { GlobalMemoryStatusEx(mem_info) }
     }
     fn open_process_token(
         &self,
@@ -215,7 +215,7 @@ impl WindowsApi for RealWindowsApi {
         desired_access: TOKEN_ACCESS_MASK,
         token_handle: &mut WinHandle,
     ) -> Result<(), WinError> {
-        unsafe { OpenProcessToken(process, desired_access, token_handle).map(|_| ()) }
+        unsafe { OpenProcessToken(process, desired_access, token_handle) }
     }
     fn lookup_privilege_value_w(
         &self,
@@ -223,7 +223,7 @@ impl WindowsApi for RealWindowsApi {
         name: PCWSTR,
         luid: &mut LUID,
     ) -> Result<(), WinError> {
-        unsafe { LookupPrivilegeValueW(None, name, luid).map(|_| ()) }
+        unsafe { LookupPrivilegeValueW(None, name, luid) }
     }
     fn adjust_token_privileges(
         &self,
@@ -243,7 +243,6 @@ impl WindowsApi for RealWindowsApi {
                 previous_state,
                 return_length,
             )
-            .map(|_| ())
         }
     }
 }
@@ -330,7 +329,7 @@ fn wide_to_string(wide: &[u16]) -> String {
 ///
 /// # Returns
 /// Total memory in bytes, or 0 if the call fails (with an error logged)
-pub fn get_total_memory(ctx: &ServiceContext) -> u64 {
+#[must_use] pub fn get_total_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -392,7 +391,7 @@ fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
     }
 }
 
-/// Enables the SE_DEBUG_NAME privilege for the current process.
+/// Enables the `SE_DEBUG_NAME` privilege for the current process.
 ///
 /// Required to access detailed information about all processes.
 ///
@@ -616,7 +615,7 @@ fn monitor_and_terminate(
 // Define the Windows service entry point
 define_windows_service!(ffi_service_main, freeze_buster_service);
 
-/// Main service logic for FreezeBusterService.
+/// Main service logic for `FreezeBusterService`.
 ///
 /// Handles service lifecycle and delegates to `run_service`.
 fn freeze_buster_service(arguments: Vec<std::ffi::OsString>) {
@@ -698,7 +697,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// Entry point for the FreezeBusterService.
+/// Entry point for the `FreezeBusterService`.
 ///
 /// Initializes logging and starts the service dispatcher.
 ///
@@ -726,9 +725,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write, path::Path};
+    use std::{fs::File, io::Write};
 
-    use serde_json;
+    
     use tempfile::TempDir;
 
     use super::*;
@@ -834,7 +833,7 @@ mod tests {
 
         let start_time = Instant::now();
         let elapsed = Duration::from_secs(1);
-        let prev_time = start_time - elapsed;
+        let prev_time = start_time.checked_sub(elapsed).unwrap();
 
         let process_data = ProcessData {
             prev_working_set: 10_485_760, // 10 MB
@@ -852,7 +851,7 @@ mod tests {
         let delta_working_set = current_working_set - process_data.prev_working_set;
         let growth_mb_per_sec = (delta_working_set as f64 / (1024.0 * 1024.0)) / elapsed;
         let delta_page_faults = current_page_faults - process_data.prev_page_faults;
-        let page_fault_rate = delta_page_faults as f64 / elapsed;
+        let page_fault_rate = f64::from(delta_page_faults) / elapsed;
 
         assert!(growth_mb_per_sec > 9.0 && growth_mb_per_sec < 11.0);
         assert_eq!(page_fault_rate as u32, 50); // 50 page faults per second

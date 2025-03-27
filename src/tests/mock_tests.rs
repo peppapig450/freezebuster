@@ -11,7 +11,7 @@ mod mock_tests {
         Win32::{
             Foundation::{HANDLE as WinHandle, LUID},
             Security::{
-                SE_DEBUG_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+                TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
             },
             System::{
                 Diagnostics::ToolHelp::{CREATE_TOOLHELP_SNAPSHOT_FLAGS, PROCESSENTRY32W},
@@ -93,8 +93,7 @@ mod mock_tests {
         let duration = adjust_sleep_duration(&ctx);
         assert!(
             (duration.as_secs_f64() - 30.0).abs() < 1e-6,
-            "Expected ~30s, got {:?}",
-            duration
+            "Expected ~30s, got {duration:?}"
         );
     }
 
@@ -217,7 +216,7 @@ mod mock_tests {
             ..Default::default()
         };
         mock_api.expect_process32_first_w().returning(move |_, e| {
-            *e = entry.clone();
+            *e = entry;
             Ok(())
         });
         mock_api
@@ -277,7 +276,7 @@ mod mock_tests {
             ..Default::default()
         };
         mock_api.expect_process32_first_w().returning(move |_, e| {
-            *e = entry.clone();
+            *e = entry;
             Ok(())
         });
         mock_api
@@ -321,7 +320,7 @@ mod mock_tests {
             123,
             ProcessData {
                 prev_working_set: 10_485_760, // 10 MB
-                prev_time: Instant::now() - Duration::from_secs(1),
+                prev_time: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
                 prev_page_faults: 100,
                 working_set_violations: 0,
                 page_fault_violations: 0,
