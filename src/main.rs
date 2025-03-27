@@ -776,6 +776,41 @@ mod tests {
     }
 
     #[test]
+    fn test_read_config_missing_fields() {
+        let config_json = r#"
+        {
+            "min_available_memory_mb": 512,
+            "whitelist": ["notepad.exe"]
+        }
+    "#; // Missing max_working_set_growth_mb_per_sec, max_page_faults_per_sec, violations_before_termination
+        let (_dir, path) = create_temp_config(config_json);
+        let result = read_config(&path);
+        assert!(
+            result.is_err(),
+            "Expected error due to missing required fields"
+        );
+    }
+
+    #[test]
+    fn test_service_context_new_valid() {
+        let config_json = r#"
+        {
+            "max_working_set_growth_mb_per_sec": 10.0,
+            "min_available_memory_mb": 512,
+            "max_page_faults_per_sec": 1000,
+            "violations_before_termination": 3,
+            "whitelist": ["Notepad.EXE"]
+        }
+    "#;
+        let (_dir, path) = create_temp_config(config_json);
+        let api = Box::new(RealWindowsApi); // Real API for initialization test
+        let result = ServiceContext::new(api, &path);
+        assert!(result.is_ok());
+        let ctx = result.unwrap();
+        assert_eq!(ctx.config.whitelist, vec!["notepad.exe"]); // Check case conversion and sorting
+    }
+
+    #[test]
     fn test_read_config_missing_file() {
         let result = read_config("non_existent_config.json");
         assert!(result.is_err());
@@ -790,14 +825,6 @@ mod tests {
         let empty = vec![0];
         let result = wide_to_string(&empty);
         assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_adjust_sleep_duration() {
-        // This is tricky to test precisely due to system calls, but we can verify boundaries
-        let duration = adjust_sleep_duration();
-        assert!(duration.as_secs_f64() >= 0.1); // MIN_SLEEP_SECS
-        assert!(duration.as_secs_f64() <= 30.0); // MAX_SLEEP_SECS
     }
 
     // Mock ProcessData for testing growth calculations
@@ -831,40 +858,6 @@ mod tests {
         assert_eq!(page_fault_rate as u32, 50); // 50 page faults per second
     }
 
-    // Integration test suggestion (cannot run in standard test environment)
-    #[test]
-    #[ignore]
-    fn test_monitor_and_terminate() {
-        // This would require:
-        // 1. Mocking Windows API calls (CreateToolhelp32Snapshot, etc.)
-        // 2. Simulating process memory usage
-        // 3. Verifying termination logic
-        // Suggested approach:
-        // - Use a mocking crate like `mockall`
-        // - Create mock processes with controlled memory growth
-        // - Test whitelist, violation counting, and termination logic
-        let config = Config {
-            max_working_set_growth_mb_per_sec: 5.0,
-            min_available_memory_mb: 1024,
-            max_page_faults_per_sec: 1000,
-            violations_before_termination: 2,
-            whitelist: vec!["test.exe".to_string()],
-        };
-        let mut process_data = HashMap::new();
-        let total_memory = 8_589_934_592; // 8 GB
-        let now = Instant::now();
-        let mut system_processes = HashMap::new();
-        let mut first_run = true;
-
-        // Mock setup would go here
-        let result = monitor_and_terminate(
-            &config,
-            &mut process_data,
-            total_memory,
-            now,
-            &mut system_processes,
-            &mut first_run,
-        );
-        assert!(result.is_ok());
-    }
+    #[cfg(test)]
+    mod mock_tests;
 }
