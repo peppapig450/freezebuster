@@ -51,7 +51,7 @@ use crate::system::check_process;
 ///
 /// Defines thresholds and rules for process monitoring and termination.
 #[derive(Deserialize, Debug)]
-struct Config {
+pub struct Config {
     /// Maximum allowed working set growth rate in megabytes per second (MB/s).
     max_working_set_growth_mb_per_sec: f64,
     /// Minimum available physical memory in megabytes (MB) before termination is considered.
@@ -330,7 +330,7 @@ fn wide_to_string(wide: &[u16]) -> String {
 ///
 /// # Returns
 /// Total memory in bytes, or 0 if the call fails (with an error logged)
-fn get_total_memory(ctx: &ServiceContext) -> u64 {
+pub fn get_total_memory(ctx: &ServiceContext) -> u64 {
     let mut mem_info = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -401,7 +401,7 @@ fn adjust_sleep_duration(ctx: &ServiceContext) -> Duration {
 ///
 /// # Errors
 /// Returns an error if privilege adjustment fails.
-fn enable_se_debug_privilege(ctx: &ServiceContext) -> Result<(), Box<dyn Error>> {
+pub fn enable_se_debug_privilege(ctx: &ServiceContext) -> Result<(), Box<dyn Error>> {
     let mut token: WinHandle = WinHandle(std::ptr::null_mut());
     unsafe {
         ctx.api
