@@ -3,5 +3,7 @@
   "min_available_memory_mb": 500,
   "max_page_faults_per_sec": 1000,
   "violations_before_termination": 3,
-  "whitelist": ["notepad.exe", "explorer.exe"]
+  "whitelist": ["notepad.exe", "explorer.exe"],
+  "log_file_path": "C:\\ProgramData\\FreezeBuster\\service.log",
+  "log_level": "warn"
 }
