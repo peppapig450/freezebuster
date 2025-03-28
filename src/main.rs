@@ -3,6 +3,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fs::{self, File},
+    io::BufReader,
     os::windows::ffi::OsStringExt,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
@@ -12,7 +13,7 @@ use std::{
 
 use log::{error, info, warn};
 use serde::Deserialize;
-use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, WriteLogger};
+use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, WriteLogger};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE as WinHandle, LUID},
@@ -318,12 +319,40 @@ fn get_config_path(arguments: &[OsString]) -> Result<String, Box<dyn Error>> {
 /// # Errors
 /// Returns an error if the file cannot be opened and the embedded default JSON is invalid.
 fn read_config(path: &str) -> Result<Config, Box<dyn Error>> {
-    let mut config: Config = if let Ok(file) = File::open(path) {
-        info!("Loaded config from {}", path);
-        serde_json::from_reader(file)?
-    } else {
-        info!("File {} not found, using embedded default config", path);
-        serde_json::from_str(DEFAULT_CONFIG)?
+    let mut config: Config = match File::open(path) {
+        Ok(file) => {
+            info!("Loaded config from {}", path);
+            let reader = BufReader::new(file);
+            match serde_json::from_reader(reader) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    warn!(
+                        "Failed to parse config file {}: {}, using embedded default config",
+                        path, err
+                    );
+                    match serde_json::from_str(DEFAULT_CONFIG) {
+                        Ok(cfg) => cfg,
+                        Err(default_err) => {
+                            error!("Embedded default config is invalid: {}", default_err);
+                            return Err(default_err.into());
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                "Failed to open config file {}: {}, using embedded default config",
+                path, err
+            );
+            match serde_json::from_str(DEFAULT_CONFIG) {
+                Ok(cfg) => cfg,
+                Err(default_err) => {
+                    error!("Embedded default config is invalid: {}", default_err);
+                    return Err(default_err.into());
+                }
+            }
+        }
     };
 
     // Convert whitelist to lowercase for case-insensitive comparison
@@ -690,6 +719,15 @@ fn freeze_buster_service(arguments: Vec<OsString>) {
 /// # Errors
 /// Returns an error if service initialization, logging setup, or execution fails.
 fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
+    // Bootstrap logging to stderr with a default level (e.g., Info)
+    let bootstrap_config = ConfigBuilder::new().set_time_format_rfc3339().build();
+    CombinedLogger::init(vec![TermLogger::new(
+        LevelFilter::Info,
+        bootstrap_config.clone(),
+        simplelog::TerminalMode::Stderr,
+        simplelog::ColorChoice::Never,
+    )])?;
+
     let config_path = get_config_path(&arguments)?;
     let config = read_config(&config_path)?;
 
@@ -700,16 +738,23 @@ fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
         "warn" => LevelFilter::Warn,
         "error" => LevelFilter::Error,
         "off" => LevelFilter::Off,
-        other => return Err(format!("Invalid log level: {}", other).into()),
+        other => {
+            error!("Invalid log level in config: {}", other);
+            return Err(format!("Invalid log level: {}", other).into());
+        }
     };
 
     setup_logging(&config.log_file_path, log_level)?;
-
-    info!("Using config from {}", config_path);
+    info!("Using config from {}: {:?}", config_path, config);
 
     let api = Box::new(RealWindowsApi);
     let ctx = ServiceContext::new(api, config)?;
-    enable_se_debug_privilege(&ctx)?;
+    if let Err(e) = enable_se_debug_privilege(&ctx) {
+        warn!(
+            "Failed to enable SE_DEBUG_NAME privilege: {}. Running with limited access.",
+            e
+        )
+    }
 
     // Allocate stop on the heap and leak it to give it a 'static lifetime
     let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
@@ -741,6 +786,7 @@ fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let total_memory = get_total_memory(&ctx);
     let mut system_processes = HashMap::new();
     let mut first_run = true;
+    let mut retry_count = 0;
 
     while !stop.load(Ordering::SeqCst) {
         let now = Instant::now();
@@ -753,6 +799,13 @@ fn run_service(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
             &mut first_run,
         ) {
             error!("Monitoring error: {e}");
+            retry_count += 1;
+            if retry_count > 3 {
+                error!("Too many monitoring failures, shutting down.");
+                break;
+            }
+        } else {
+            retry_count = 0;
         }
         let sleep_duration = adjust_sleep_duration(&ctx);
         thread::sleep(sleep_duration);
@@ -824,7 +877,7 @@ mod tests {
         assert_eq!(config.min_available_memory_mb, 512);
         assert_eq!(config.max_page_faults_per_sec, 1000);
         assert_eq!(config.violations_before_termination, 3);
-        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]); // Note: sorted and lowercase
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]); // Sorted and lowercase
         assert_eq!(config.log_file_path, "log.txt");
         assert_eq!(config.log_level, "info");
     }
@@ -835,7 +888,22 @@ mod tests {
         let (_dir, path) = create_temp_config(config_json);
 
         let result = read_config(&path);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "Should fall back to default config for invalid JSON"
+        );
+
+        let config = result.unwrap();
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 500);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+        assert_eq!(
+            config.log_file_path,
+            "C:\\ProgramData\\FreezeBuster\\service.log"
+        );
+        assert_eq!(config.log_level, "warn");
     }
 
     #[test]
@@ -845,13 +913,52 @@ mod tests {
             "min_available_memory_mb": 512,
             "whitelist": ["notepad.exe"]
         }
-    "#; // Missing max_working_set_growth_mb_per_sec, max_page_faults_per_sec, violations_before_termination
+        "#; // Missing required fields
         let (_dir, path) = create_temp_config(config_json);
+
         let result = read_config(&path);
         assert!(
-            result.is_err(),
-            "Expected error due to missing required fields"
+            result.is_ok(),
+            "Should fall back to default config for missing fields"
         );
+
+        let config = result.unwrap();
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 500);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+        assert_eq!(
+            config.log_file_path,
+            "C:\\ProgramData\\FreezeBuster\\service.log"
+        );
+        assert_eq!(config.log_level, "warn");
+    }
+
+    #[test]
+    fn test_read_config_empty_file() {
+        let (_dir, path) = create_temp_config("");
+        println!("DEFAULT_CONFIG: '{}'", DEFAULT_CONFIG);
+        let result = read_config(&path);
+        if result.is_err() {
+            println!("Error from read_config: {:?}", result.as_ref().err());
+        }
+        assert!(
+            result.is_ok(),
+            "Should fall back to default config for empty file"
+        );
+
+        let config = result.unwrap();
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 500);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+        assert_eq!(
+            config.log_file_path,
+            "C:\\ProgramData\\FreezeBuster\\service.log"
+        );
+        assert_eq!(config.log_level, "warn");
     }
 
     #[test]
@@ -869,7 +976,7 @@ mod tests {
         let result = ServiceContext::new(api, config);
         assert!(result.is_ok());
         let ctx = result.unwrap();
-        assert_eq!(ctx.config.whitelist, vec!["notepad.exe"]); // Check case conversion and sorting
+        assert_eq!(ctx.config.whitelist, vec!["notepad.exe"]);
         assert_eq!(ctx.config.log_file_path, "log.txt");
         assert_eq!(ctx.config.log_level, "info");
     }
@@ -880,24 +987,10 @@ mod tests {
         let result = read_config(path);
         assert!(result.is_ok(), "Should fall back to default config");
         let config = result.unwrap();
-        // Assuming DEFAULT_CONFIG is valid JSON in your project
-        // Replace these with actual values from your DEFAULT_CONFIG
-        assert_eq!(
-            config.max_working_set_growth_mb_per_sec,
-            /* expected default */ 10.0
-        );
-        assert_eq!(
-            config.min_available_memory_mb,
-            /* expected default */ 500
-        );
-        assert_eq!(
-            config.max_page_faults_per_sec,
-            /* expected default */ 1000
-        );
-        assert_eq!(
-            config.violations_before_termination,
-            /* expected default */ 3
-        );
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 500);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
         assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
         assert_eq!(
             config.log_file_path,
@@ -918,7 +1011,7 @@ mod tests {
             "log_file_path": "log.txt",
             "log_level": "info"
         }
-    "#;
+        "#;
         let (_dir, path) = create_temp_config(config_json);
         let config = read_config(&path).unwrap();
         assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
@@ -926,7 +1019,6 @@ mod tests {
 
     #[test]
     fn test_default_config_validity() {
-        // Temporarily override DEFAULT_CONFIG for this test if needed
         let default_config = r#"
         {
             "max_working_set_growth_mb_per_sec": 10.0,
@@ -937,7 +1029,7 @@ mod tests {
             "log_file_path": "log.txt",
             "log_level": "info"
         }
-    "#;
+        "#;
         let config = serde_json::from_str(default_config).expect("Default config should be valid");
         let Config { whitelist, .. } = config;
         assert_eq!(whitelist, Vec::<String>::new());
@@ -957,10 +1049,25 @@ mod tests {
             "log_file_path": "log.txt",
             "log_level": "info"
         }
-    "#;
+        "#;
         let (_dir, path) = create_temp_config(config_json);
         let result = read_config(&path);
-        assert!(result.is_err(), "Invalid type should fail");
+        assert!(
+            result.is_ok(),
+            "Should fall back to default config for invalid types"
+        );
+
+        let config = result.unwrap();
+        assert_eq!(config.max_working_set_growth_mb_per_sec, 10.0);
+        assert_eq!(config.min_available_memory_mb, 500);
+        assert_eq!(config.max_page_faults_per_sec, 1000);
+        assert_eq!(config.violations_before_termination, 3);
+        assert_eq!(config.whitelist, vec!["explorer.exe", "notepad.exe"]);
+        assert_eq!(
+            config.log_file_path,
+            "C:\\ProgramData\\FreezeBuster\\service.log"
+        );
+        assert_eq!(config.log_level, "warn");
     }
 
     #[test]
